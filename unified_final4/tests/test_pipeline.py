@@ -19,6 +19,7 @@ from oefof_pl.compute.aggregate import AggLine
 from oefof_pl.config import load_default_config
 from oefof_pl.email_sender.outlook import EmailSendResult
 from oefof_pl.exceptions import DataLoadError
+from oefof_pl.exceptions import OefofError
 from oefof_pl.pipeline import (
     PL_REPORT_FILENAME,
     RESULTS_PARQUET,
@@ -221,6 +222,16 @@ def test_pipeline_aborts_when_bottler_load_fails(monkeypatch, tmp_path: Path):
     assert result.aborted_at == "load-trades"
 
 
+def test_pipeline_strict_release_discipline_blocks(monkeypatch, tmp_path: Path):
+    _patch_loaders(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+
+    monkeypatch.setattr(P, "enforce_release_discipline", lambda **kw: (_ for _ in ()).throw(OefofError("not tagged")))
+    result = run_pipeline(cfg, PipelineOptions(start_yyyymmdd="20251231", strict_run=True))
+    assert result.ok is False
+    assert result.aborted_at == "release-discipline"
+
+
 # ─── Critical-validation branch ─────────────────────────────────────────────
 
 def test_pipeline_critical_validation_writes_failure_artifacts(monkeypatch, tmp_path: Path):
@@ -253,6 +264,27 @@ def test_pipeline_critical_validation_writes_failure_artifacts(monkeypatch, tmp_
     assert result.results_parquet_path.exists()
     # Analyst map still saved on failure.
     assert "save-analyst-map" in _stage_names(result)
+
+
+def test_pipeline_strict_promotes_val10_warn_to_fail(monkeypatch, tmp_path: Path):
+    _patch_loaders(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(P, "enforce_release_discipline", lambda **kw: None)
+
+    from oefof_pl.validate.checks import CheckResult, ValidationResult
+    warned = ValidationResult(checks=(
+        CheckResult(id="VAL-10", name="Phantom zero positions", status="WARN",
+                    detail="warned", failures=()),
+    ))
+    monkeypatch.setattr(P, "run_all_checks", lambda **kw: warned)
+
+    result = run_pipeline(
+        cfg, PipelineOptions(start_yyyymmdd="20251231", strict_run=True),
+        extractor=lambda hp_val_path, *, target_pname: [[None]*12],
+        closer=lambda p: False,
+    )
+    assert result.ok is False
+    assert result.aborted_at == "validate"
 
 
 # ─── Email branch ────────────────────────────────────────────────────────────

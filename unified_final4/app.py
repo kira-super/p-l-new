@@ -81,6 +81,14 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--apply-suggestions", action="append", default=[],
                    metavar="PATH",
                    help="Additional CA-overrides CSV (repeatable).")
+    p.add_argument("--strict-run", action="store_true",
+                   help="Enable production hard gates (override approvals, reconciliation, anomaly/release checks).")
+    p.add_argument("--override-approvals", default="",
+                   help="CSV of approved override usage (default from config).")
+    p.add_argument("--known-exceptions", default="",
+                   help="CSV register of approved anomaly/reconciliation exceptions (default from config).")
+    p.add_argument("--prior-audit", default="",
+                   help="Prior run audit JSON for day-over-day anomaly gate.")
 
     zzzz = p.add_mutually_exclusive_group()
     zzzz.add_argument("--drop-zzzz-ps-trades", dest="drop_zzzz_ps_trades",
@@ -136,7 +144,7 @@ def _apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     return replace(cfg, **overrides) if overrides else cfg
 
 
-def _options(args: argparse.Namespace) -> PipelineOptions:
+def _options(args: argparse.Namespace, cfg: Config) -> PipelineOptions:
     return PipelineOptions(
         start_yyyymmdd=args.start,
         end_yyyymmdd=args.end,
@@ -147,6 +155,10 @@ def _options(args: argparse.Namespace) -> PipelineOptions:
         email_body=args.email_body,
         email_from_smtp=args.email_from_smtp,
         extra_ca_override_paths=tuple(Path(p) for p in args.apply_suggestions),
+        strict_run=bool(args.strict_run),
+        override_approvals_path=(Path(args.override_approvals) if args.override_approvals else cfg.override_approvals_path),
+        known_exceptions_path=(Path(args.known_exceptions) if args.known_exceptions else cfg.known_exceptions_path),
+        prior_audit_path=(Path(args.prior_audit) if args.prior_audit else None),
     )
 
 
@@ -154,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     fund_label, _ = _FUNDS[args.fund]
     cfg = _apply_overrides(_load_fund_config(args.fund), args)
-    options = _options(args)
+    options = _options(args, cfg)
 
     print("=" * 72)
     print(f" {fund_label} — P&L pipeline")

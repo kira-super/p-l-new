@@ -36,6 +36,14 @@ def _parse(argv=None) -> argparse.Namespace:
                    metavar="PATH",
                    help="Additional CA-overrides CSV to apply (typically out/ca_suggestions_*.csv). "
                         "Repeat the flag to apply multiple files.")
+    p.add_argument("--strict-run", action="store_true",
+                   help="Enable production hard gates (override approvals, reconciliation, anomaly/release checks).")
+    p.add_argument("--override-approvals", default="",
+                   help="CSV of approved override usage (default from config).")
+    p.add_argument("--known-exceptions", default="",
+                   help="CSV register of approved anomaly/reconciliation exceptions (default from config).")
+    p.add_argument("--prior-audit", default="",
+                   help="Prior run audit JSON for day-over-day anomaly gate.")
     return p.parse_args(argv)
 
 
@@ -50,7 +58,9 @@ def _apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     return replace(cfg, **overrides) if overrides else cfg
 
 
-def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
+def _options_from_args(args: argparse.Namespace, cfg: Config | None = None) -> PipelineOptions:
+    if cfg is None:
+        cfg = load_default_config()
     return PipelineOptions(
         start_yyyymmdd=args.start,
         end_yyyymmdd=args.end,
@@ -61,6 +71,10 @@ def _options_from_args(args: argparse.Namespace) -> PipelineOptions:
         email_body=args.email_body,
         email_from_smtp=args.email_from_smtp,
         extra_ca_override_paths=tuple(Path(p) for p in args.apply_suggestions),
+        strict_run=bool(args.strict_run),
+        override_approvals_path=(Path(args.override_approvals) if args.override_approvals else cfg.override_approvals_path),
+        known_exceptions_path=(Path(args.known_exceptions) if args.known_exceptions else cfg.known_exceptions_path),
+        prior_audit_path=(Path(args.prior_audit) if args.prior_audit else None),
     )
 
 
@@ -73,7 +87,7 @@ def _print_stages(result) -> None:
 def main(argv=None) -> int:
     args = _parse(argv)
     cfg = _apply_overrides(load_default_config(), args)
-    options = _options_from_args(args)
+    options = _options_from_args(args, cfg)
 
     print(f"Running OEFOF P&L pipeline (start={options.start_yyyymmdd or '<default>'}, "
           f"end={options.end_yyyymmdd or '<from VDATE>'})")

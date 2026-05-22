@@ -45,6 +45,8 @@ class PipelineResult:
     ca_suggestions_path: Path | None = None
     unassigned_isins_path: Path | None = None
     end_date: pd.Timestamp | None = None  # period end VDATE (for CA persistence)
+    audit_json_path: Path | None = None
+    monitor_alerts_path: Path | None = None
 
     def by_stage(self, name: str) -> StageResult:
         for s in self.stages:
@@ -66,3 +68,7 @@ class PipelineOptions:
     email_from_smtp: str = ""
     fund_name: str = "OAKS Emerging and Frontier Fund"
     extra_ca_override_paths: tuple[Path, ...] = ()  # e.g. --apply-suggestions out/ca_suggestions_*.csv
+    strict_run: bool = False
+    override_approvals_path: Path | None = None
+    known_exceptions_path: Path | None = None
+    prior_audit_path: Path | None = None

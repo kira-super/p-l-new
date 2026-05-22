@@ -220,6 +220,10 @@ behavioural difference is that `app.py` defaults `--send-email` to **on**.
 | `--analyst-map PATH`          | Override `cfg.analyst_map_path`.                                     |
 | `--output-dir PATH`           | Override `cfg.output_dir`.                                           |
 | `--apply-suggestions PATH`    | Apply additional CA-overrides CSV. Repeatable.                       |
+| `--strict-run`                | Enable production hard gates (release, approvals, reconciliation, anomaly). |
+| `--override-approvals PATH`   | CSV approvals register for manual CA/bonus override usage.           |
+| `--known-exceptions PATH`     | CSV exception register (`date,scope,key,reason,approver`) for controlled bypasses. |
+| `--prior-audit PATH`          | Previous `run_audit_latest.json` used for day-over-day anomaly checks. |
 | `--send-email` / `--no-email` | Send (or skip) the Outlook email. `app.py` defaults to **on**.       |
 | `--email-to ADDR`             | Recipient(s); comma/semicolon separated.                             |
 | `--email-cc ADDR`             | CC recipient(s).                                                     |

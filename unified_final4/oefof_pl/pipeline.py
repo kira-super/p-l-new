@@ -57,6 +57,19 @@ from .compute.exposure import (
 from .compute.fx import build_fx_supplement, build_fx_table, resolve_eur_usd
 from .compute.pl import compute_positions
 from .config import Config
+from .control import (
+    build_audit_payload,
+    build_inflation_diagnostics,
+    collect_input_hashes,
+    detect_day_over_day_anomalies,
+    enforce_override_approvals,
+    enforce_release_discipline,
+    escalate_validation_for_strict,
+    load_json,
+    load_known_exceptions,
+    reconcile_against_db_views,
+    write_json,
+)
 from .data.ca_overrides import (
     apply_bonus_price_overrides,
     append_history,
@@ -115,6 +128,12 @@ RESULTS_PARQUET = "pl_results.parquet"
 FAILURE_PARQUET_PREFIX = "pl_results_failed_"
 FAILURE_XLSX_PREFIX = "VALIDATION_FAILURE_"
 DIAGNOSTICS_PREFIX = "pnl_diagnostics_"
+INFLATION_DIAGNOSTICS_PREFIX = "inflation_diagnostics_"
+AUDIT_JSON_LATEST = "run_audit_latest.json"
+MONITOR_ALERTS_PREFIX = "monitor_alerts_"
+_ANOMALY_ANALYST_THRESHOLD_EUR = 150_000.0
+_ANOMALY_ISIN_THRESHOLD_EUR = 100_000.0
+_ANOMALY_TOTAL_THRESHOLD_EUR = 300_000.0
 
 
 # ─── Public entry ────────────────────────────────────────────────────────────
@@ -153,6 +172,9 @@ def run_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     diag_rows: list[dict[str, object]] = []
     diag_path = output_dir / f"{DIAGNOSTICS_PREFIX}{pipeline_start_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    inflation_diag_path = output_dir / f"{INFLATION_DIAGNOSTICS_PREFIX}{pipeline_start_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    audit_json_path = output_dir / AUDIT_JSON_LATEST
+    monitor_alerts_path = output_dir / f"{MONITOR_ALERTS_PREFIX}{pipeline_start_time.strftime('%Y%m%d_%H%M%S')}.json"
 
     def _diag_summary(stage: str, metric: str, value, detail: str = "") -> None:
         diag_rows.append({
@@ -196,7 +218,22 @@ def run_pipeline(
         _write_diagnostics()
         return PipelineResult(
             ok=False, stages=tuple(stages), aborted_at=stage_name,
+            audit_json_path=audit_json_path if audit_json_path.exists() else None,
+            monitor_alerts_path=monitor_alerts_path if monitor_alerts_path.exists() else None,
         )
+
+    # ── 0. Strict release discipline ─────────────────────────────────────────
+    if options.strict_run:
+        try:
+            enforce_release_discipline(strict_run=True, cwd=Path(__file__).resolve().parents[1])
+            stages.append(StageResult(
+                "release-discipline", True,
+                "git tag/clean checks passed.",
+                {"strict": True},
+            ))
+        except OefofError as exc:
+            stages.append(StageResult("release-discipline", False, str(exc)))
+            return _abort("release-discipline")
 
     # ── 1. Load end snapshot (SQL: ccl.dbo.vw_RPT_VAL) ──────────────────────
     # End VDATE: explicit --end-yyyymmdd if given, else the latest VDATE
@@ -343,6 +380,7 @@ def run_pipeline(
     _diag_summary("filter-trade-window", "rows_dropped", len(trades_df) - len(filtered))
     trades_df = filtered
 
+    patched_bonus = 0
     # ── 5a. Optional bonus-price overrides (price-only, no unit change) ─────
     try:
         bonus_prices = load_bonus_prices(cfg.ca_bonus_prices_path)
@@ -389,6 +427,23 @@ def run_pipeline(
     except Exception as exc:
         stages.append(StageResult("load-manual-ca-overrides", False, str(exc)))
         return _abort("load-manual-ca-overrides")
+
+    # ── 5c. Strict approval gate for override usage ─────────────────────────
+    try:
+        enforce_override_approvals(
+            strict_run=options.strict_run,
+            date_yyyymmdd=end_yyyymmdd,
+            approvals_path=options.override_approvals_path,
+            bonus_patched_rows=patched_bonus,
+            manual_override_count=len(manual_ca_overrides),
+        )
+        stages.append(StageResult(
+            "strict-override-approvals", True,
+            f"strict={options.strict_run} bonus_patched={patched_bonus} manual={len(manual_ca_overrides)}",
+        ))
+    except OefofError as exc:
+        stages.append(StageResult("strict-override-approvals", False, str(exc)))
+        return _abort("strict-override-approvals")
 
     # ── 6. Aggregate portfolios ──────────────────────────────────────────────
     # HP_VAL is a *firm-wide* snapshot (~30 PCODEs). The bottler trades are
@@ -608,6 +663,7 @@ def run_pipeline(
         eur_usd_end=eur_usd_end,
         th_val_df=th_val_df,
     )
+    validation = escalate_validation_for_strict(validation, strict_run=options.strict_run)
     fail_ids = [c.id for c in validation.checks if c.status == "FAIL"]
     warn_ids = [c.id for c in validation.checks if c.status == "WARN"]
     stages.append(StageResult(
@@ -615,6 +671,57 @@ def run_pipeline(
         f"FAIL={len(fail_ids)} WARN={len(warn_ids)}",
         {"fail_ids": tuple(fail_ids), "warn_ids": tuple(warn_ids)},
     ))
+
+    # ── 10b. Mandatory reconciliation + anomaly gates ───────────────────────
+    known_ex = load_known_exceptions(options.known_exceptions_path)
+    reconciliation = reconcile_against_db_views(
+        pl_df=pl_df,
+        end_df=end_df,
+        trades_df=trades_df,
+        date_yyyymmdd=end_yyyymmdd,
+        known_exceptions=known_ex,
+    )
+    stages.append(StageResult(
+        "reconcile-db",
+        reconciliation["ok"] or (not options.strict_run),
+        f"issues={reconciliation['summary'].get('issues', 0)} strict={options.strict_run}",
+        {"summary": reconciliation["summary"]},
+    ))
+    if options.strict_run and not reconciliation["ok"]:
+        stages.append(StageResult(
+            "reconcile-db-gate", False,
+            "strict run: reconciliation mismatch blocks publish.",
+        ))
+        write_json(monitor_alerts_path, {
+            "type": "reconciliation_mismatch",
+            "date": end_yyyymmdd,
+            "issues": reconciliation.get("issues", []),
+        })
+        return _abort("reconcile-db-gate")
+
+    prior_audit = load_json(options.prior_audit_path or audit_json_path)
+    anomalies = detect_day_over_day_anomalies(
+        pl_df=pl_df,
+        previous_audit=prior_audit,
+        date_yyyymmdd=end_yyyymmdd,
+        known_exceptions=known_ex,
+        analyst_threshold_eur=_ANOMALY_ANALYST_THRESHOLD_EUR,
+        isin_threshold_eur=_ANOMALY_ISIN_THRESHOLD_EUR,
+        total_threshold_eur=_ANOMALY_TOTAL_THRESHOLD_EUR,
+    )
+    stages.append(StageResult(
+        "anomaly-gate",
+        anomalies["ok"] or (not options.strict_run),
+        f"anomalies={anomalies['summary'].get('count', 0)} strict={options.strict_run}",
+        {"summary": anomalies["summary"]},
+    ))
+    if options.strict_run and not anomalies["ok"]:
+        write_json(monitor_alerts_path, {
+            "type": "anomaly_gate_fail",
+            "date": end_yyyymmdd,
+            "anomalies": anomalies.get("anomalies", []),
+        })
+        return _abort("anomaly-gate")
 
     # ── 11. Always drop pl_results.parquet ───────────────────────────────────
 
@@ -628,6 +735,28 @@ def run_pipeline(
     except Exception as exc:
         stages.append(StageResult("write-results-parquet", False, str(exc)))
         return _abort("write-results-parquet")
+
+    # ── 11b. Inflation/duplicate diagnostics artifact ───────────────────────
+    try:
+        compute_stage = next((s for s in stages if s.name == "compute-positions"), None)
+        zzzz_ps_dropped = int((compute_stage.artifacts or {}).get("zzzz_ps_rows_dropped", 0)) if compute_stage else 0
+        derive_stage = next((s for s in stages if s.name == "derive-ca-auto"), None)
+        auto_count = int((derive_stage.artifacts or {}).get("auto", 0)) if derive_stage else 0
+        build_inflation_diagnostics(
+            pl_df=pl_df,
+            trades_df=trades_df,
+            out_path=inflation_diag_path,
+            manual_ca_count=len(manual_ca_overrides),
+            auto_ca_count=auto_count,
+            zzzz_ps_dropped=zzzz_ps_dropped,
+        )
+        stages.append(StageResult(
+            "write-inflation-diagnostics", True,
+            str(inflation_diag_path),
+            {"path": str(inflation_diag_path)},
+        ))
+    except Exception as exc:
+        stages.append(StageResult("write-inflation-diagnostics", False, str(exc)))
 
     # ── 12. Branch: critical → failure artifacts, no P&L workbook ────────────
     # NAV reconciliation must use the full SQL-filtered OEFOF-family snapshot
@@ -683,7 +812,44 @@ def run_pipeline(
     )
     ts_str = pipeline_start_time.strftime("%Y%m%d_%H%M%S")
 
+    # ── 11c. Run audit payload (golden source + input hashes) ───────────────
+    try:
+        input_hashes = collect_input_hashes([
+            Path(cfg.analyst_map_path),
+            Path(cfg.ca_overrides_path),
+            Path(cfg.ca_bonus_prices_path),
+            *(Path(p) for p in options.extra_ca_override_paths),
+            *( [Path(options.override_approvals_path)] if options.override_approvals_path else [] ),
+            *( [Path(options.known_exceptions_path)] if options.known_exceptions_path else [] ),
+        ])
+        audit_payload = build_audit_payload(
+            cfg_name=cfg.fund_name,
+            date_yyyymmdd=end_yyyymmdd,
+            strict_run=options.strict_run,
+            pl_df=pl_df,
+            input_hashes=input_hashes,
+            reconciliation=reconciliation,
+            anomalies=anomalies,
+        )
+        write_json(audit_json_path, audit_payload)
+        stages.append(StageResult(
+            "write-run-audit", True,
+            str(audit_json_path),
+            {"path": str(audit_json_path)},
+        ))
+    except Exception as exc:
+        stages.append(StageResult("write-run-audit", False, str(exc)))
+
     if validation.has_critical:
+        try:
+            write_json(monitor_alerts_path, {
+                "type": "validation_failure",
+                "date": end_yyyymmdd,
+                "fail_ids": fail_ids,
+                "warn_ids": warn_ids,
+            })
+        except Exception:
+            pass
         failure_parquet = output_dir / f"{FAILURE_PARQUET_PREFIX}{ts_str}.parquet"
         failure_xlsx = output_dir / f"{FAILURE_XLSX_PREFIX}{ts_str}.xlsx"
         # Auto-detect VAL-01 → suggestions CSV BEFORE the workbook so the
@@ -748,6 +914,8 @@ def run_pipeline(
             results_parquet_path=results_parquet,
             ca_suggestions_path=suggestions_path,
             unassigned_isins_path=unassigned_path,
+            audit_json_path=audit_json_path if audit_json_path.exists() else None,
+            monitor_alerts_path=monitor_alerts_path if monitor_alerts_path.exists() else None,
         )
 
     # ── 12b. Build P&L workbook (with optional ValuationA embed) ─────────────
@@ -838,6 +1006,6 @@ def run_pipeline(
         email_result=email_result,
         unassigned_isins_path=unassigned_path,
         end_date=pd.Timestamp(end_vdate),
+        audit_json_path=audit_json_path if audit_json_path.exists() else None,
+        monitor_alerts_path=monitor_alerts_path if monitor_alerts_path.exists() else None,
     )
-
-

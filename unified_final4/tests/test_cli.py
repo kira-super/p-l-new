@@ -18,6 +18,7 @@ def test_parse_defaults_are_blank_strings():
     assert args.start == ""
     assert args.end == ""
     assert args.send_email is False
+    assert args.strict_run is False
 
 
 def test_parse_path_overrides(tmp_path: Path):
@@ -27,6 +28,10 @@ def test_parse_path_overrides(tmp_path: Path):
         "--output-dir", str(tmp_path / "o"),
         "--send-email",
         "--email-to", "a@b.com",
+        "--strict-run",
+        "--override-approvals", str(tmp_path / "approvals.csv"),
+        "--known-exceptions", str(tmp_path / "exceptions.csv"),
+        "--prior-audit", str(tmp_path / "audit.json"),
     ])
     cfg = cli._apply_overrides(load_default_config(), args)
     assert cfg.sql_conn_str == "DRIVER={fake};Server=test;"
@@ -35,6 +40,10 @@ def test_parse_path_overrides(tmp_path: Path):
     opts = cli._options_from_args(args)
     assert opts.send_email is True
     assert opts.email_to == "a@b.com"
+    assert opts.strict_run is True
+    assert opts.override_approvals_path == tmp_path / "approvals.csv"
+    assert opts.known_exceptions_path == tmp_path / "exceptions.csv"
+    assert opts.prior_audit_path == tmp_path / "audit.json"
 
 
 def test_apply_overrides_no_args_returns_same_cfg():

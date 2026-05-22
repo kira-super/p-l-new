@@ -42,6 +42,8 @@ ANALYST_MAP_PATH = Path("isin_analyst_map.csv")
 CA_OVERRIDES_PATH = Path("inputs/ca_overrides.csv")
 CA_HISTORY_PATH = Path("inputs/ca_overrides_history.csv")
 CA_BONUS_PRICES_PATH = Path("inputs/ca_bonus_prices.csv")
+OVERRIDE_APPROVALS_PATH = Path("inputs/override_approvals.csv")
+KNOWN_EXCEPTIONS_PATH = Path("inputs/known_exceptions.csv")
 OUTPUT_DIR = Path("out")
 # Per-month OneDrive archive of the published P&L workbook. The pipeline
 # copies every successful build into <REPORT_ARCHIVE_ROOT>/<YYYY-MM Month>/
@@ -163,6 +165,8 @@ class Config:
     ca_overrides_path: Path
     ca_history_path: Path
     ca_bonus_prices_path: Path
+    override_approvals_path: Path
+    known_exceptions_path: Path
     output_dir: Path
     report_archive_root: Path
     sql_conn_str: str
@@ -200,6 +204,8 @@ def load_default_config() -> Config:
         ca_overrides_path=CA_OVERRIDES_PATH,
         ca_history_path=CA_HISTORY_PATH,
         ca_bonus_prices_path=CA_BONUS_PRICES_PATH,
+        override_approvals_path=OVERRIDE_APPROVALS_PATH,
+        known_exceptions_path=KNOWN_EXCEPTIONS_PATH,
         output_dir=OUTPUT_DIR,
         report_archive_root=REPORT_ARCHIVE_ROOT,
         sql_conn_str=SQL_CONN_STR,
@@ -219,5 +225,4 @@ def load_default_config() -> Config:
         split_ca_rows=SPLIT_CA_ROWS,
         start_snapshot_default=START_SNAPSHOT_DEFAULT,
     )
-
 
