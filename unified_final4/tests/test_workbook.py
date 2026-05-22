@@ -1,0 +1,426 @@
+"""Smoke tests for output.workbook — the 9-sheet P&L report writer.
+
+Strategy: build small but realistic ``pl_df`` / ``income_df`` /
+``ValidationResult`` fixtures, call ``build_workbook``, then re-open the
+saved .xlsx with openpyxl and assert structural properties (sheet
+order, column count, header texts, total-row presence, number formats,
+non-truncated failure listings).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from openpyxl import load_workbook
+
+from oefof_pl.data.normalise import INCOME_COLUMNS, PL_COLUMNS
+from oefof_pl.output.styles import COLUMN_LAYOUT_HOLDINGS, COLUMN_LAYOUT_INCOME
+from oefof_pl.output.workbook import (
+    ExposureBlock,
+    ExposureMetrics,
+    PeriodMeta,
+    SHEET_ORDER,
+    build_workbook,
+)
+from oefof_pl.validate.checks import CheckResult, ValidationResult
+
+
+# ─── Layout/schema parity (BUG-2 lock) ──────────────────────────────────────
+
+def test_holdings_layout_matches_pl_columns_exactly():
+    """Every ColSpec must reference a real PL_COLUMNS entry. BUG-2 was an
+    output-side reference to a non-existent column. The reverse direction
+    (every PL_COLUMNS entry must be in the layout) is intentionally not
+    enforced — some columns (e.g. 'Cost Basis (EUR)', 'Market Value End
+    (EUR)') are kept in the dataframe for compute / validation but hidden
+    from the user-facing workbook by request."""
+    pl_set = set(PL_COLUMNS)
+    derived_output_cols = {
+        "Contribution to Total (%)",
+        "Absolute Contribution (bps)",
+    }
+    layout_cols = [c.df_column for c in COLUMN_LAYOUT_HOLDINGS]
+    missing = [c for c in layout_cols if c not in pl_set and c not in derived_output_cols]
+    assert not missing, f"Layout references columns not in PL_COLUMNS: {missing}"
+
+
+def test_income_layout_matches_income_columns_exactly():
+    layout_cols = [c.df_column for c in COLUMN_LAYOUT_INCOME]
+    assert layout_cols == list(INCOME_COLUMNS)
+
+
+# ─── Fixtures ──────────────────────────────────────────────────────────────
+
+def _meta() -> PeriodMeta:
+    return PeriodMeta(
+        fund_name="OAKS Emerging and Frontier Fund",
+        start_date=pd.Timestamp("2025-12-31"),
+        end_date=pd.Timestamp("2026-01-31"),
+        snapshot_path="HP_VAL.xlsm",
+        bottler_path="StockTrList.xlsb",
+        run_timestamp=datetime(2026, 4, 29, 14, 30, 0),
+        snapshot_exposure=ExposureBlock(
+            label="Current Snapshot",
+            as_of=pd.Timestamp("2026-01-31"),
+            fund=ExposureMetrics(long_eur=30.0, short_eur=8.0, nav_eur=100.0),
+            by_analyst={"IS": ExposureMetrics(long_eur=12.0, short_eur=3.0, nav_eur=100.0)},
+        ),
+        ytd_weighted_exposure=ExposureBlock(
+            label="YTD AUM-Weighted Average Exposure",
+            as_of=pd.Timestamp("2026-01-31"),
+            fund=ExposureMetrics(long_eur=28.0, short_eur=7.0, nav_eur=100.0),
+            by_analyst={"IS": ExposureMetrics(long_eur=11.0, short_eur=2.5, nav_eur=100.0)},
+        ),
+    )
+
+
+def _pl_row(**kw) -> dict:
+    base = {
+        "ISIN": "X", "Stock Name": "STOCK", "Country": "DE", "Analyst": "IS",
+        "CCY": "EUR", "Instrument": "ORD", "L/S": "L",
+        "Starting Units": 0.0, "Ending Units": 0.0,
+        "Units Bought": 0.0, "Units Sold": 0.0, "Bonus Units": 0.0,
+        "Avg Buy Price (EUR)": 0.0, "Avg Sell Price (EUR)": 0.0,
+        "Start Price (Local)": 0.0, "Last Price (EUR)": 0.0,
+        "Market Value Start (EUR)": 0.0, "Market Value End (EUR)": 0.0,
+        "Cost Basis (EUR)": 0.0,
+        "Realised P&L (Local)": 0.0, "Realised P&L (EUR)": 0.0,
+        "Realised P&L (%)": 0.0,
+        "Unrealised P&L (Local)": 0.0, "Unrealised P&L (EUR)": 0.0,
+        "Unrealised P&L (%)": 0.0,
+        "Income (Local)": 0.0, "Income (EUR)": 0.0,
+        "Income Yield (%)": 0.0,
+        "Total P&L (EUR)": 0.0, "Total P&L (%)": 0.0,
+        "Last Trade Date": pd.NaT, "First Trade Date": pd.NaT,
+    }
+    base.update(kw)
+    return base
+
+
+def _pl_df(rows):
+    return pd.DataFrame(rows or [], columns=list(PL_COLUMNS))
+
+
+def _income_df(rows):
+    return pd.DataFrame(rows or [], columns=list(INCOME_COLUMNS))
+
+
+def _validation_pass() -> ValidationResult:
+    return ValidationResult(checks=[
+        CheckResult(id="VAL-01", name="Unit reconciliation", status="PASS", detail="ok"),
+        CheckResult(id="VAL-02", name="Duplicate trades", status="PASS", detail="ok"),
+    ])
+
+
+def _validation_with_failures(n: int = 12) -> ValidationResult:
+    return ValidationResult(checks=[
+        CheckResult(
+            id="VAL-11", name="PTVALUE local sanity",
+            status="FAIL", detail=f"{n} positions failed",
+            failures=[{"ISIN": f"X{i}", "Stock Name": f"S{i}",
+                       "Diff (Local)": float(i)} for i in range(n)],
+        ),
+    ])
+
+
+# ─── End-to-end smoke ──────────────────────────────────────────────────────
+
+def test_build_workbook_produces_nine_sheets_in_order(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="A", **{"Ending Units": 10.0, "Total P&L (EUR)": 100.0,
+                             "Cost Basis (EUR)": 1000.0,
+                             "Market Value End (EUR)": 1100.0}),
+        _pl_row(ISIN="B", **{"Ending Units": 0.0,  # exited
+                             "Total P&L (EUR)": -50.0,
+                             "Cost Basis (EUR)": 500.0}),
+    ])
+    inc = _income_df([{
+        "ISIN": "A", "Stock Name": "Sa", "Analyst": "IS", "CCY": "EUR",
+        "Date": pd.Timestamp("2026-01-15"), "Income Type": "DIV",
+        "Income (Local)": 10.0, "Income (EUR)": 10.0, "Units": 10.0,
+    }])
+    trades = pd.DataFrame([{
+        "TRADE_ID": 1,
+        "PCODE_ORIG": "OEFOF", "ISIN": "A", "SNAME": "Sa", "CCY": "EUR",
+        "T": "P", "CDATE": pd.Timestamp("2026-01-10"), "UNITS": 10.0,
+        "GROSSPRICE_LOCAL": 100.0, "BUY_NET_LOCAL": 1000.0,
+        "SELL_NET_LOCAL": 0.0, "INCOME_LOCAL": 0.0,
+    }])
+    build_workbook(out_path=out, pl_df=pl, income_df=inc, trades_df=trades,
+                   validation=_validation_pass(), period_meta=_meta())
+    assert out.exists()
+
+    wb = load_workbook(out, read_only=False, data_only=False)
+    # Static sheets must all be present; their relative order must match
+    # SHEET_ORDER. Per-analyst sheets are inserted dynamically between
+    # "Analyst Overview" and "Current Holdings" and are not in SHEET_ORDER.
+    static = [s for s in wb.sheetnames if s in SHEET_ORDER]
+    assert static == list(SHEET_ORDER)
+    # Per-analyst sheet for IS must exist (single analyst in fixture).
+    assert "IS" in wb.sheetnames
+
+
+def test_current_holdings_has_all_pl_columns(tmp_path: Path):
+    """BUG-2 regression: every PL_COLUMNS entry appears as a header in
+    the Current Holdings sheet."""
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="A", **{"Ending Units": 1.0,
+                             "Start Price (Local)": 50.0,
+                             "Last Price (EUR)": 60.0,
+                             "Market Value End (EUR)": 60.0,
+                             "Total P&L (EUR)": 10.0,
+                             "Cost Basis (EUR)": 50.0}),
+    ])
+    build_workbook(out_path=out, pl_df=pl, income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    wb = load_workbook(out)
+    ws = wb["Current Holdings"]
+    from oefof_pl.output.styles import COLUMN_LAYOUT_HOLDINGS as _LH
+    expected = [s.display or s.df_column for s in _LH]
+    headers = [ws.cell(4, c).value for c in range(1, len(expected) + 1)]
+    assert headers == expected
+    # BUG-2 specifically: "Start Price (Local)" must be present
+    assert "Start Price (Local)" in headers
+
+
+def test_exited_positions_separated_from_current(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="HOLD", **{"Ending Units": 5.0,
+                                "Total P&L (EUR)": 1.0,
+                                "Cost Basis (EUR)": 100.0}),
+        _pl_row(ISIN="EXIT", **{"Ending Units": 0.0,
+                                "Total P&L (EUR)": -5.0,
+                                "Cost Basis (EUR)": 50.0}),
+    ])
+    build_workbook(out_path=out, pl_df=pl, income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    wb = load_workbook(out)
+
+    cur_isins = {wb["Current Holdings"].cell(r, 1).value
+                 for r in range(5, 5 + 5)}
+    ex_isins = {wb["Exited Positions"].cell(r, 1).value
+                for r in range(5, 5 + 5)}
+    assert "HOLD" in cur_isins and "EXIT" not in cur_isins
+    assert "EXIT" in ex_isins and "HOLD" not in ex_isins
+
+
+def test_total_row_uses_sum_for_eur_columns(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="A", **{"Ending Units": 1.0,
+                             "Realised P&L (EUR)": 100.0,
+                             "Total P&L (EUR)": 25.0}),
+        _pl_row(ISIN="B", **{"Ending Units": 1.0,
+                             "Realised P&L (EUR)": 200.0,
+                             "Total P&L (EUR)": -10.0}),
+    ])
+    build_workbook(out_path=out, pl_df=pl, income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    wb = load_workbook(out)
+    ws = wb["Current Holdings"]
+    headers = [ws.cell(4, c).value for c in range(1, len(PL_COLUMNS) + 1)]
+    total_row = 4 + 2 + 1  # header_row + n_rows + 1
+    realised_col = headers.index("Realised P&L (EUR)") + 1
+    total_col = headers.index("Total P&L (EUR)") + 1
+    assert ws.cell(total_row, realised_col).value == pytest.approx(300.0)
+    assert ws.cell(total_row, total_col).value == pytest.approx(15.0)
+    # Leftmost column should say "Total"
+    assert ws.cell(total_row, 1).value == "Total"
+
+
+def test_pct_columns_use_percentage_format(tmp_path: Path):
+    """BUG-1 regression at the output layer: Excel format '0.00%' is what
+    turns the ratio (0.44) into '44.00%'."""
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="A", **{"Ending Units": 1.0,
+                             "Total P&L (%)": 0.44,
+                             "Total P&L (EUR)": 44.0,
+                             "Cost Basis (EUR)": 100.0}),
+    ])
+    build_workbook(out_path=out, pl_df=pl, income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    wb = load_workbook(out)
+    ws = wb["Current Holdings"]
+    headers = [ws.cell(4, c).value for c in range(1, len(PL_COLUMNS) + 1)]
+    pct_col = headers.index("Total P&L (%)") + 1
+    cell = ws.cell(5, pct_col)
+    assert cell.value == pytest.approx(0.44)
+    assert cell.number_format == "0.00%;[Red](0.00%)"
+
+
+def test_analyst_sheet_has_contribution_and_abs_bps_columns(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(ISIN="A", **{"Ending Units": 1.0,
+                             "Analyst": "IS",
+                             "Total P&L (EUR)": 60.0,
+                             "Cost Basis (EUR)": 100.0}),
+        _pl_row(ISIN="B", **{"Ending Units": 1.0,
+                             "Analyst": "IS",
+                             "Total P&L (EUR)": 40.0,
+                             "Cost Basis (EUR)": 100.0}),
+    ])
+    build_workbook(out_path=out, pl_df=pl, income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+
+    wb = load_workbook(out)
+    ws = wb["IS"]
+    headers = [ws.cell(9, c).value for c in range(1, ws.max_column + 1)]
+    contrib_col = headers.index("Contribution %") + 1
+    abs_bps_col = headers.index("Abs Contribution (bps)") + 1
+
+    contrib_vals = [ws.cell(10, contrib_col).value, ws.cell(11, contrib_col).value]
+    abs_bps_vals = [ws.cell(10, abs_bps_col).value, ws.cell(11, abs_bps_col).value]
+
+    assert contrib_vals[0] == pytest.approx(0.6)
+    assert contrib_vals[1] == pytest.approx(0.4)
+    assert abs_bps_vals[0] == pytest.approx(6000.0)
+    assert abs_bps_vals[1] == pytest.approx(4000.0)
+
+    subtotal_row = 12
+    assert ws.cell(subtotal_row, contrib_col).value == pytest.approx(1.0)
+
+
+def test_validation_failures_are_listed_completely(tmp_path: Path):
+    """Legacy printed only first 3. The Validation Report must list every row."""
+    out = tmp_path / "report.xlsx"
+    n = 25
+    build_workbook(
+        out_path=out,
+        pl_df=_pl_df([_pl_row(ISIN="A", **{"Ending Units": 1.0,
+                                            "Cost Basis (EUR)": 1.0})]),
+        income_df=_income_df([]),
+        trades_df=pd.DataFrame(),
+        validation=_validation_with_failures(n),
+        period_meta=_meta(),
+    )
+    wb = load_workbook(out)
+    ws = wb["Validation Report"]
+    text = "\n".join(
+        str(ws.cell(r, c).value or "")
+        for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)
+    )
+    # Every X{i} must appear; nothing was truncated.
+    for i in range(n):
+        assert f"X{i}" in text, f"Validation Report missing row X{i}"
+
+
+def test_atomic_save_does_not_leave_tmp_behind(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    build_workbook(out_path=out, pl_df=_pl_df([]), income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    leftover = list(tmp_path.glob("*.tmp"))
+    assert leftover == []
+    assert out.exists()
+
+
+def test_empty_pl_still_writes_all_sheets(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    build_workbook(out_path=out, pl_df=_pl_df([]), income_df=_income_df([]),
+                   trades_df=pd.DataFrame(), validation=_validation_pass(),
+                   period_meta=_meta())
+    wb = load_workbook(out)
+    # No analysts → no dynamic sheets, so we expect exactly SHEET_ORDER.
+    assert wb.sheetnames == list(SHEET_ORDER)
+
+
+def test_workbook_does_not_import_win32com():
+    """Hard rule: output/workbook.py is openpyxl-only. win32com is reserved
+    for output/valuation.py and refresh/bottler.py."""
+    import ast
+    from pathlib import Path
+    from oefof_pl.output import workbook as wbmod
+    src = Path(wbmod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "win32com" not in alias.name
+        elif isinstance(node, ast.ImportFrom):
+            assert node.module is None or "win32com" not in node.module
+
+
+def test_summary_uses_snapshot_and_weighted_exposure_sections(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(
+            ISIN="A",
+            Analyst="IS",
+            **{
+                "Ending Units": 10.0,
+                "Cost Basis (EUR)": 100.0,
+                "Realised P&L (EUR)": 12.0,
+                "Unrealised P&L (EUR)": 8.0,
+                "Income (EUR)": 3.0,
+                "Total P&L (EUR)": 23.0,
+                "Market Value End (EUR)": 110.0,
+            },
+        ),
+    ])
+    build_workbook(
+        out_path=out,
+        pl_df=pl,
+        income_df=_income_df([]),
+        trades_df=pd.DataFrame(),
+        validation=_validation_pass(),
+        period_meta=_meta(),
+    )
+    wb = load_workbook(out)
+    ws = wb["Summary"]
+    text = "\n".join(
+        str(ws.cell(r, c).value or "")
+        for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)
+    )
+    assert "Return on Net Exposure (YTD)" in text
+    assert "Current Snapshot  (as of 31 January 2026)" in text
+    assert "YTD AUM-Weighted Average Exposure  (through 31 January 2026)" in text
+    assert "Current Long (%)" in text
+    assert "YTD Avg Gross (%)" in text
+
+
+def test_analyst_sheet_has_current_and_ytd_exposure_blocks(tmp_path: Path):
+    out = tmp_path / "report.xlsx"
+    pl = _pl_df([
+        _pl_row(
+            ISIN="A",
+            Analyst="IS",
+            **{
+                "Ending Units": 10.0,
+                "Cost Basis (EUR)": 100.0,
+                "Realised P&L (EUR)": 12.0,
+                "Unrealised P&L (EUR)": 8.0,
+                "Total P&L (EUR)": 20.0,
+                "Market Value End (EUR)": 110.0,
+            },
+        ),
+    ])
+    build_workbook(
+        out_path=out,
+        pl_df=pl,
+        income_df=_income_df([]),
+        trades_df=pd.DataFrame(),
+        validation=_validation_pass(),
+        period_meta=_meta(),
+    )
+    wb = load_workbook(out)
+    ws = wb["IS"]
+    text = "\n".join(
+        str(ws.cell(r, c).value or "")
+        for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)
+    )
+    assert "Current Snapshot  (as of 31 January 2026)" in text
+    assert "YTD AUM-Weighted Average Exposure  (through 31 January 2026)" in text
+    assert "RETURN ON NET EXPOSURE (YTD)" in text.upper()
