@@ -222,7 +222,7 @@ def test_load_bottler_renames_and_drops_tradegross_usd(tmp_path: Path, monkeypat
     _patch_read_excel(monkeypatch, df)
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")  # need file to exist for path check
-    out = load_bottler(p, oefof_pcodes=("OEFOF", "OEFOGSSC"))
+    out = load_bottler(p, fund_pcodes=("OEFOF", "OEFOGSSC"))
 
     assert "TRADEGROSS_USD" not in out.columns  # BUG-4 structural drop
     assert "GROSSPRICE_LOCAL" in out.columns
@@ -243,7 +243,7 @@ def test_load_bottler_preserves_derivative_isin_suffix(tmp_path: Path, monkeypat
     _patch_read_excel(monkeypatch, df)
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
-    out = load_bottler(p, oefof_pcodes=("OEFOF",))
+    out = load_bottler(p, fund_pcodes=("OEFOF",))
 
     assert out["ISIN"].iloc[0] == "KYG8879R1048:FUT"
 
@@ -257,7 +257,7 @@ def test_load_bottler_filters_pcode(tmp_path: Path, monkeypatch):
     _patch_read_excel(monkeypatch, df)
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
-    out = load_bottler(p, oefof_pcodes=("OEFOF", "OEFOHFSC"))
+    out = load_bottler(p, fund_pcodes=("OEFOF", "OEFOHFSC"))
     assert set(out["PCODE_ORIG"]) == {"OEFOF", "OEFOHFSC"}
     assert "OTHER" not in set(out["PCODE_ORIG"])
 
@@ -270,7 +270,7 @@ def test_load_bottler_drops_deleted_rows(tmp_path: Path, monkeypatch):
     _patch_read_excel(monkeypatch, df)
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
-    out = load_bottler(p, oefof_pcodes=("OEFOF",))
+    out = load_bottler(p, fund_pcodes=("OEFOF",))
     assert len(out) == 1
     assert float(out["UNITS"].iloc[0]) == 1.0
 
@@ -283,12 +283,12 @@ def test_load_bottler_empty_after_filter_raises(tmp_path: Path, monkeypatch):
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
     with pytest.raises(EmptyDataError):
-        load_bottler(p, oefof_pcodes=("OEFOF",))
+        load_bottler(p, fund_pcodes=("OEFOF",))
 
 
 def test_load_bottler_missing_file(tmp_path: Path):
     with pytest.raises(DataLoadError):
-        load_bottler(tmp_path / "nope.xlsb", oefof_pcodes=("OEFOF",))
+        load_bottler(tmp_path / "nope.xlsb", fund_pcodes=("OEFOF",))
 
 
 def test_load_bottler_empty_pcodes_rejected(tmp_path: Path, monkeypatch):
@@ -299,7 +299,7 @@ def test_load_bottler_empty_pcodes_rejected(tmp_path: Path, monkeypatch):
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
     with pytest.raises(ValueError):
-        load_bottler(p, oefof_pcodes=())
+        load_bottler(p, fund_pcodes=())
 
 
 def test_load_bottler_missing_pcode_column_raises(tmp_path: Path, monkeypatch):
@@ -308,4 +308,4 @@ def test_load_bottler_missing_pcode_column_raises(tmp_path: Path, monkeypatch):
     p = tmp_path / "bottler.xlsb"
     p.write_bytes(b"")
     with pytest.raises(SchemaError):
-        load_bottler(p, oefof_pcodes=("OEFOF",))
+        load_bottler(p, fund_pcodes=("OEFOF",))

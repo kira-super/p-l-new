@@ -79,17 +79,17 @@ def _patch_loaders(monkeypatch, *, start_df=None, end_df=None, trades_df=None,
     e = end_df if end_df is not None else _port_df(vdate=end_vdate, units=150.0)
     t = trades_df if trades_df is not None else _trades_df()
 
-    def fake_load_snapshot_sql(yyyymmdd, *, conn_str, oefof_pcodes):
+    def fake_load_snapshot_sql(yyyymmdd, *, conn_str, fund_pcodes):
         # Disambiguate by requested date: anything matching the start vdate
         # returns the start frame, anything else the end frame.
         if pd.Timestamp(yyyymmdd) == pd.Timestamp(start_vdate).normalize():
             return s, start_vdate
         return e, end_vdate
 
-    def fake_resolve_latest(*, conn_str, oefof_pcodes):
+    def fake_resolve_latest(*, conn_str, fund_pcodes):
         return pd.Timestamp(end_vdate).strftime("%Y%m%d")
 
-    def fake_load_trades_sql(*, conn_str, oefof_pcodes):
+    def fake_load_trades_sql(*, conn_str, fund_pcodes):
         return t.copy()
 
     monkeypatch.setattr(P, "load_snapshot_sql", fake_load_snapshot_sql)
@@ -192,12 +192,12 @@ def test_pipeline_rejects_end_yyyymmdd_when_vdate_disagrees(monkeypatch, tmp_pat
 def test_pipeline_aborts_when_hp_val_load_fails(monkeypatch, tmp_path: Path):
     cfg = _make_cfg(tmp_path)
 
-    def fake_load(yyyymmdd, *, conn_str, oefof_pcodes):
+    def fake_load(yyyymmdd, *, conn_str, fund_pcodes):
         raise DataLoadError("vw_RPT_VAL unreachable")
 
     monkeypatch.setattr(P, "load_snapshot_sql", fake_load)
     monkeypatch.setattr(P, "_resolve_latest_sql_vdate",
-                        lambda *, conn_str, oefof_pcodes: "20260504")
+                        lambda *, conn_str, fund_pcodes: "20260504")
     monkeypatch.setattr(P, "load_trades_sql", lambda **k: pd.DataFrame())
 
     result = run_pipeline(cfg, PipelineOptions())
