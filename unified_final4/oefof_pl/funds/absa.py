@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
 
-from oefof_pl.config import Config, load_default_config
+from oefof_pl.config import ANALYST_CODES, Config, load_default_config
 
 
 # ─── Production paths ────────────────────────────────────────────────────────
@@ -49,15 +49,8 @@ FTSWAP_ISINS: frozenset[str] = frozenset()
 
 
 # ─── Analyst codes ────────────────────────────────────────────────────────────
-ANALYST_CODES: dict[str, str] = {
-    "IS": "Ian Simmons",
-    "HK": "Hayden Kwan",
-    "JB": "Julius Bottcher",
-    "SB": "Stefan Bottcher",
-    "KX": "Karen Xiao",
-    "VS": "Vijay Singh",
-    "AS": "Alexander Short",
-}
+# Re-uses the shared ANALYST_CODES dict from config.py. Both funds share the
+# same analyst team, so the mapping lives in one place.
 
 PERSON_OVERRIDES_BY_SECURITY: dict[str, str] = {}
 

@@ -35,8 +35,6 @@ from __future__ import annotations
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -46,6 +44,11 @@ from openpyxl.styles import Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from ..compute.exposure import (  # noqa: F401  (re-exported for backwards compat)
+    ExposureBlock,
+    ExposureMetrics,
+    PeriodMeta,
+)
 from ..validate.checks import ValidationResult
 from .styles import (
     ALIGN_CENTER,
@@ -132,65 +135,6 @@ ANALYST_DISPLAY: dict[str, str] = {
 ANALYST_TAB_ORDER: tuple[str, ...] = (
     "IS", "HK", "JB", "SB", "KX", "VS", "AS", "VJ", "UNASSIGNED",
 )
-
-
-@dataclass
-class ExposureMetrics:
-    """Exposure figures for one entity (fund or analyst).
-
-    ``short_eur`` is always a positive absolute magnitude (not signed).
-    net  = long − short
-    gross = long + short
-    """
-    long_eur: float = 0.0
-    short_eur: float = 0.0
-    nav_eur: float = 0.0
-
-    @property
-    def net_eur(self) -> float:
-        return self.long_eur - self.short_eur
-
-    @property
-    def gross_eur(self) -> float:
-        return self.long_eur + self.short_eur
-
-    def pct_of_nav(self, value: float) -> float | None:
-        return value / self.nav_eur if self.nav_eur > 1e-9 else None
-
-
-@dataclass
-class ExposureBlock:
-    """Snapshot or AUM-weighted exposure for the fund and per analyst."""
-    label: str = ""
-    as_of: pd.Timestamp | None = None
-    fund: ExposureMetrics = field(default_factory=ExposureMetrics)
-    by_analyst: dict[str, ExposureMetrics] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PeriodMeta:
-    """All non-numeric context the workbook needs."""
-    fund_name: str
-    start_date: pd.Timestamp
-    end_date: pd.Timestamp
-    fund_currency: str = "EUR"
-    snapshot_path: str = ""
-    bottler_path: str = ""
-    run_timestamp: datetime = field(default_factory=datetime.now)
-    # Optional NAV reconciliation components (EUR). Ordered tuple of
-    # (label, value, is_total) rows rendered on the Summary sheet. Bridges
-    # the equity-only stock MV to the HP_VAL fund portfolio total.
-    nav_components: tuple[tuple[str, float, bool], ...] | None = None
-    # Optional total NAV at start of period (EUR). When present, the
-    # Summary headline ``Total P&L %`` is reported as Total P&L / NAV start
-    # — the apples-to-apples denominator vs. the firm's TWR dashboard,
-    # which divides the period P&L by starting fund NAV (stocks + cash
-    # − accruals at 31-Dec).
-    nav_total_start: float | None = None
-    # Current-snapshot exposure (from end-period HiPort snapshot).
-    snapshot_exposure: ExposureBlock | None = None
-    # AUM-weighted daily average exposure over the full period.
-    ytd_weighted_exposure: ExposureBlock | None = None
 
 
 # ─── Public entry point ─────────────────────────────────────────────────────

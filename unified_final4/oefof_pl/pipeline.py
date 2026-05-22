@@ -44,8 +44,22 @@ import pandas as pd
 
 from .analyst.map import UNASSIGNED, AnalystMap
 from .compute.aggregate import AggLine, aggregate_portfolio
+from .compute.ca_split import split_ca_rows
+from .compute.exposure import (
+    ExposureBlock,
+    ExposureMetrics,
+    PeriodMeta,
+    build_analyst_lookup as _build_analyst_lookup,
+    build_snapshot_exposure as _build_snapshot_exposure,
+    build_weighted_exposure as _build_weighted_exposure,
+    compute_nav_components as _compute_nav_components,
+    compute_nav_total as _compute_nav_total,
+    resolve_snapshot_analyst as _resolve_snapshot_analyst,
+    snapshot_exposure_magnitude as _snapshot_exposure_magnitude,
+    _aum_weight_metrics,
+)
 from .compute.fx import build_fx_supplement, build_fx_table, resolve_eur_usd
-from .compute.pl import compute_positions, split_ca_rows
+from .compute.pl import compute_positions
 from .config import Config
 from .data.ca_overrides import (
     apply_bonus_price_overrides,
@@ -88,12 +102,13 @@ from .output.valuation import (
     close_open_excel_workbook,
     extract_valuation_a_via_sql,
 )
-from .output.workbook import ExposureBlock, ExposureMetrics, PeriodMeta, build_workbook
+from .output.workbook import build_workbook
 from .validate import ValidationResult, run_all_checks
 
 
 # ─── Output filenames ────────────────────────────────────────────────────────
 
+PL_REPORT_FILENAME = "OAKS_EM_Stock_PL_Report.xlsx"
 RESULTS_PARQUET = "pl_results.parquet"
 FAILURE_PARQUET_PREFIX = "pl_results_failed_"
 FAILURE_XLSX_PREFIX = "VALIDATION_FAILURE_"
@@ -983,211 +998,6 @@ def _filter_snapshot_to_pcodes(
     pcodes_upper = {str(p).strip().upper() for p in fund_pcodes}
     mask = port_df["PCODE_ORIG"].astype(str).str.strip().str.upper().isin(pcodes_upper)
     return port_df.loc[mask].reset_index(drop=True)
-
-
-def _compute_nav_components(
-    end_df_oefof: pd.DataFrame, pl_df: pd.DataFrame,
-) -> tuple[tuple[str, float, bool], ...] | None:
-    """Build the NAV reconciliation rows for the Summary sheet.
-
-    Bridges the equity-only stock MV (what our P&L engine reports) to the
-    HP_VAL fund portfolio total (sum of every PTVALUE_EUR row HiPort
-    carries for the OEFOF PCODE family). The gap is non-equity items —
-    cash, FX equivalents, accrued fees, swap P&L cash buckets, dividend
-    receivables — which are intentionally outside the stock-level model.
-
-    Returns ``None`` if the snapshot is missing the required columns
-    (lets unit tests using stub frames skip rendering).
-    """
-    if end_df_oefof.empty:
-        return None
-    needed = {"PTVALUE_EUR", "ISIN", "CAT", "SNAME"}
-    if not needed.issubset(end_df_oefof.columns):
-        return None
-
-    df = end_df_oefof.copy()
-    df["__isin__"] = df["ISIN"].astype(str).str.strip()
-    df["__val__"] = pd.to_numeric(df["PTVALUE_EUR"], errors="coerce").fillna(0.0)
-
-    # Stock MV: take from pl_df so it matches what's printed elsewhere on
-    # the Summary (uses our positions engine, not raw snapshot).
-    stock_mv = float(pd.to_numeric(
-        pl_df.get("Market Value End (EUR)", pd.Series(dtype=float)),
-        errors="coerce",
-    ).fillna(0.0).sum())
-
-    # Cash bucket: rows with no real ISIN. Split positives from negatives
-    # so the user sees what's an asset vs an accrual/expense.
-    no_isin = df[df["__isin__"].isin(["", "nan", "NAN", "None", "NaN"])]
-    cash_pos = float(no_isin.loc[no_isin["__val__"] > 0, "__val__"].sum())
-    cash_neg = float(no_isin.loc[no_isin["__val__"] < 0, "__val__"].sum())
-
-    # HP_VAL fund total = sum of every PTVALUE_EUR (equity + cash + accruals).
-    hp_val_total = float(df["__val__"].sum())
-
-    return (
-        ("Stock Market Value (Equities, our P&L)", stock_mv, False),
-        ("+ Cash & FX Equivalents", cash_pos, False),
-        ("− Accrued Fees, Expenses & Swap P&L", cash_neg, False),
-        ("Total — HP_VAL OEFOF Portfolio (EUR)", hp_val_total, True),
-    )
-
-
-def _compute_nav_total(snap_df: pd.DataFrame) -> float | None:
-    """Sum every PTVALUE_EUR row in an HP_VAL snapshot → total fund NAV.
-
-    Used to obtain the **starting NAV** denominator for the headline
-    Total P&L %: matches what the firm's per-share TWR dashboard divides
-    by (stocks + cash + accruals at the period start date). Returns
-    ``None`` when the snapshot lacks ``PTVALUE_EUR`` (e.g. unit-test
-    stubs) so the headline gracefully falls back to cost-basis %.
-    """
-    if snap_df is None or snap_df.empty or "PTVALUE_EUR" not in snap_df.columns:
-        return None
-    return float(pd.to_numeric(snap_df["PTVALUE_EUR"], errors="coerce").fillna(0.0).sum())
-
-
-def _build_snapshot_exposure(
-    snap_df: pd.DataFrame,
-    pl_df: pd.DataFrame,
-    as_of: pd.Timestamp,
-) -> ExposureBlock:
-    """Build point-in-time long/short/net/gross exposure from the end snapshot."""
-    if snap_df is None or snap_df.empty:
-        return ExposureBlock(label="Current Snapshot", as_of=as_of)
-
-    analyst_keys = _build_analyst_lookup(pl_df)
-    long_mask = snap_df["LS"].astype(str).str.upper().ne("S")
-    short_mask = snap_df["LS"].astype(str).str.upper().eq("S")
-    ptvalue = pd.to_numeric(snap_df["PTVALUE_EUR"], errors="coerce").fillna(0.0)
-    magnitude = _snapshot_exposure_magnitude(snap_df)
-    nav_eur = float(ptvalue.sum())
-
-    by_analyst: dict[str, ExposureMetrics] = {}
-    work = snap_df.copy()
-    work["__MAGNITUDE__"] = magnitude
-    work["__ANALYST__"] = work.apply(
-        lambda row: _resolve_snapshot_analyst(row, analyst_keys), axis=1,
-    )
-    for analyst, sub in work.groupby("__ANALYST__", dropna=False):
-        code = str(analyst).strip().upper() or "UNASSIGNED"
-        analyst_nav = nav_eur
-        analyst_long = float(sub.loc[sub["LS"].astype(str).str.upper().ne("S"), "__MAGNITUDE__"].sum())
-        analyst_short = float(sub.loc[sub["LS"].astype(str).str.upper().eq("S"), "__MAGNITUDE__"].sum())
-        by_analyst[code] = ExposureMetrics(
-            long_eur=max(analyst_long, 0.0),
-            short_eur=analyst_short,
-            nav_eur=analyst_nav,
-        )
-
-    return ExposureBlock(
-        label="Current Snapshot",
-        as_of=as_of,
-        fund=ExposureMetrics(
-            long_eur=float(magnitude[long_mask].sum()),
-            short_eur=float(magnitude[short_mask].sum()),
-            nav_eur=nav_eur,
-        ),
-        by_analyst=by_analyst,
-    )
-
-
-def _build_weighted_exposure(
-    history_df: pd.DataFrame,
-    nav_history_df: pd.DataFrame,
-    pl_df: pd.DataFrame,
-) -> ExposureBlock:
-    """AUM-weighted daily average exposure over the pipeline period."""
-    if history_df.empty or nav_history_df.empty:
-        return ExposureBlock(label="YTD AUM-Weighted Average Exposure")
-
-    analyst_keys = _build_analyst_lookup(pl_df)
-    work = history_df.copy()
-    work["VDATE"] = pd.to_datetime(work["VDATE"], errors="coerce").dt.normalize()
-    work["__MAGNITUDE__"] = _snapshot_exposure_magnitude(work)
-    work["__SHORT__"] = work["LS"].astype(str).str.upper().eq("S")
-    work["__ANALYST__"] = work.apply(
-        lambda row: _resolve_snapshot_analyst(row, analyst_keys), axis=1,
-    )
-    nav = nav_history_df.copy()
-    nav["VDATE"] = pd.to_datetime(nav["VDATE"], errors="coerce").dt.normalize()
-    nav = nav.groupby("VDATE", as_index=False)["NAV_EUR"].last()
-
-    daily_fund = work.groupby("VDATE").apply(
-        lambda sub: pd.Series({
-            "long_eur": float(sub.loc[~sub["__SHORT__"], "__MAGNITUDE__"].sum()),
-            "short_eur": float(sub.loc[sub["__SHORT__"], "__MAGNITUDE__"].sum()),
-        })
-    ).reset_index()
-    merged_fund = daily_fund.merge(nav, on="VDATE", how="inner")
-    fund_metrics = _aum_weight_metrics(merged_fund)
-
-    by_analyst: dict[str, ExposureMetrics] = {}
-    for analyst, sub in work.groupby("__ANALYST__", dropna=False):
-        code = str(analyst).strip().upper() or "UNASSIGNED"
-        daily = sub.groupby("VDATE").apply(
-            lambda day: pd.Series({
-                "long_eur": float(day.loc[~day["__SHORT__"], "__MAGNITUDE__"].sum()),
-                "short_eur": float(day.loc[day["__SHORT__"], "__MAGNITUDE__"].sum()),
-            })
-        ).reset_index()
-        merged = daily.merge(nav, on="VDATE", how="inner")
-        by_analyst[code] = _aum_weight_metrics(merged)
-
-    as_of = None if merged_fund.empty else pd.Timestamp(merged_fund["VDATE"].max())
-    return ExposureBlock(
-        label="YTD AUM-Weighted Average Exposure",
-        as_of=as_of,
-        fund=fund_metrics,
-        by_analyst=by_analyst,
-    )
-
-
-def _aum_weight_metrics(daily_df: pd.DataFrame) -> ExposureMetrics:
-    if daily_df.empty:
-        return ExposureMetrics()
-    nav = pd.to_numeric(daily_df["NAV_EUR"], errors="coerce").fillna(0.0)
-    nav_sum = float(nav.sum())
-    if nav_sum <= 1e-9:
-        return ExposureMetrics()
-    long_eur = float(pd.to_numeric(daily_df["long_eur"], errors="coerce").fillna(0.0).mul(nav).sum() / nav_sum)
-    short_eur = float(pd.to_numeric(daily_df["short_eur"], errors="coerce").fillna(0.0).mul(nav).sum() / nav_sum)
-    nav_avg = float(nav.mean())
-    return ExposureMetrics(long_eur=long_eur, short_eur=short_eur, nav_eur=nav_avg)
-
-
-def _build_analyst_lookup(pl_df: pd.DataFrame) -> dict[str, dict[str, str]]:
-    by_isin: dict[str, str] = {}
-    by_name: dict[str, str] = {}
-    if pl_df is None or pl_df.empty:
-        return {"isin": by_isin, "name": by_name}
-    for _, row in pl_df.iterrows():
-        analyst = str(row.get("Analyst", "")).strip().upper() or "UNASSIGNED"
-        isin = str(row.get("ISIN", "")).strip().upper()
-        sname = str(row.get("Stock Name", "")).strip().upper()
-        if isin and isin not in by_isin:
-            by_isin[isin] = analyst
-        if sname and sname not in by_name:
-            by_name[sname] = analyst
-    return {"isin": by_isin, "name": by_name}
-
-
-def _resolve_snapshot_analyst(row: pd.Series, analyst_keys: dict[str, dict[str, str]]) -> str:
-    isin = str(row.get("ISIN", "")).strip().upper()
-    sname = str(row.get("SNAME", "")).strip().upper()
-    analyst = analyst_keys["isin"].get(isin) or analyst_keys["name"].get(sname)
-    return analyst or "UNASSIGNED"
-
-
-def _snapshot_exposure_magnitude(df: pd.DataFrame) -> pd.Series:
-    ptvalue = pd.to_numeric(df.get("PTVALUE_EUR", 0.0), errors="coerce").fillna(0.0).abs()
-    if "EXPOSURE" in df.columns:
-        exposure = pd.to_numeric(df["EXPOSURE"], errors="coerce").fillna(0.0).abs()
-    else:
-        exposure = pd.Series(0.0, index=df.index, dtype=float)
-    cat = df.get("CAT", "").astype(str).str.upper()
-    use_exposure = cat.isin(["FUT", "SWAP", "FTSWAP"])
-    return exposure.where(use_exposure & exposure.gt(0.0), ptvalue)
 
 
 def _enrich_analysts_from_valuation(
