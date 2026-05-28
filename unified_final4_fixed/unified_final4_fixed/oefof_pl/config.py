@@ -139,7 +139,7 @@ PERSON_OVERRIDES_BY_SECURITY: dict[str, str] = {}
 
 # ─── Email defaults ──────────────────────────────────────────────────────────
 # Decision §18 Q6: production recipient is oaks@fieracapital.com.
-EMAIL_TO_DEFAULT = "kgontar@fieracapital.com"
+EMAIL_TO_DEFAULT = "oaks@fieracapital.com"
 EMAIL_SUBJECT_DEFAULT = "OEFOF ValuationA and P&L (inc per analyst)"
 
 
