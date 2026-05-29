@@ -51,10 +51,15 @@ from .compute.exposure import (
     PeriodMeta,
     build_snapshot_exposure as _build_snapshot_exposure,
     build_weighted_exposure as _build_weighted_exposure,
-    compute_nav_components as _compute_nav_components,
     compute_nav_total as _compute_nav_total,
 )
-from .compute.fx import build_fx_supplement, build_fx_table, resolve_eur_usd
+from .compute.fx import (
+    build_fx_from_trades,
+    build_fx_supplement,
+    build_fx_table,
+    local_to_eur_at,
+    resolve_eur_usd,
+)
 from .compute.pl import compute_positions
 from .config import Config
 from .data.ca_overrides import (
@@ -69,11 +74,12 @@ from .data.ca_overrides import (
     overrides_to_trades,
     write_suggestions_csv,
 )
+from .data.arb_pairs_loader import load_arb_pairs
+from .data.live_prices import fetch_live_prices, load_yahoo_ticker_map
 from .data.loader import assert_vdate_matches
 from .data.sql_loader import (
     fetch_eur_usd_rate,
     fetch_missing_fx_rates,
-    load_nav_history_sql,
     load_snapshot_history_sql,
     load_snapshot_sql,
     load_th_val_sql,
@@ -96,6 +102,7 @@ from .pipeline_helpers import (
     resolve_latest_sql_vdate as _resolve_latest_sql_vdate,
     save_analyst_map_safely as _save_analyst_map_safely,
     send_email as _send_email,
+    send_unassigned_alert_email as _send_unassigned_alert_email,
     to_yyyymmdd as _to_yyyymmdd,
     write_parquet_atomic as _write_parquet_atomic,
     write_unassigned_isins as _write_unassigned_isins,
@@ -197,6 +204,39 @@ def run_pipeline(
         return PipelineResult(
             ok=False, stages=tuple(stages), aborted_at=stage_name,
         )
+
+    def _live_prices_to_eur(
+        live_prices_local: Mapping[str, float],
+    ) -> dict[str, float]:
+        """Convert live prices in local CCY into EUR for workbook display."""
+        if not live_prices_local or pl_df.empty:
+            return {}
+
+        isin_series = pl_df.get("ISIN", pd.Series(dtype=object)).astype(str).str.strip().str.upper()
+        ccy_series = pl_df.get("CCY", pd.Series(dtype=object)).astype(str).str.strip().str.upper()
+        isin_to_ccy = {
+            isin: ccy
+            for isin, ccy in zip(isin_series, ccy_series)
+            if isin and ccy
+        }
+        fx_effective = {**build_fx_from_trades(trades_df), **dict(fx_start), **dict(fx_end)}
+
+        out: dict[str, float] = {}
+        for isin_raw, px_local_raw in live_prices_local.items():
+            isin = str(isin_raw).strip().upper()
+            ccy = isin_to_ccy.get(isin)
+            if not isin or not ccy:
+                continue
+            try:
+                px_local = float(px_local_raw)
+            except (TypeError, ValueError):
+                continue
+            xrate = 0.0 if ccy in {"EUR", "USD"} else float(fx_effective.get(ccy, float("nan")))
+            try:
+                out[isin] = float(local_to_eur_at(px_local, ccy, xrate, eur_usd_end))
+            except Exception:
+                continue
+        return out
 
     # ── 1. Load end snapshot (SQL: ccl.dbo.vw_RPT_VAL) ──────────────────────
     # End VDATE: explicit --end-yyyymmdd if given, else the latest VDATE
@@ -630,13 +670,6 @@ def run_pipeline(
         return _abort("write-results-parquet")
 
     # ── 12. Branch: critical → failure artifacts, no P&L workbook ────────────
-    # NAV reconciliation must use the full SQL-filtered OEFOF-family snapshot
-    # (already constrained in load_snapshot_sql by PCODE), not the stricter
-    # PCODE_ORIG filter used for trade-aligned stock reconciliation.
-    # Otherwise cash/accrual rows under sibling ORIG codes are dropped and the
-    # Summary NAV block under-reports HP_VAL by several million EUR.
-    nav_components = _compute_nav_components(end_df, pl_df)
-    nav_total_start = _compute_nav_total(start_df)
     snapshot_exposure = _build_snapshot_exposure(end_df_oefof, pl_df, pd.Timestamp(end_vdate))
     ytd_weighted_exposure: ExposureBlock | None = None
     try:
@@ -646,21 +679,11 @@ def run_pipeline(
             conn_str=cfg.sql_conn_str,
             fund_pcodes=cfg.fund_pcodes,
         )
-        nav_history_df = load_nav_history_sql(
-            start_yyyymmdd=start_yyyymmdd,
-            end_yyyymmdd=end_yyyymmdd,
-            conn_str=cfg.sql_conn_str,
-            pcode_pattern=cfg.nav_pcode_pattern,
-            nav_table=cfg.nav_sql_table,
-            pcode_column=cfg.nav_pcode_column,
-            vdate_column=cfg.nav_vdate_column,
-            nav_value_column=cfg.nav_value_column,
-        )
-        ytd_weighted_exposure = _build_weighted_exposure(history_df, nav_history_df, pl_df)
+        ytd_weighted_exposure = _build_weighted_exposure(history_df, pl_df)
         stages.append(StageResult(
             "load-exposure-history", True,
-            f"days={len(nav_history_df)} snapshot_rows={len(history_df)}",
-            {"days": len(nav_history_df), "rows": len(history_df)},
+            f"days={history_df['VDATE'].nunique()} snapshot_rows={len(history_df)}",
+            {"days": int(history_df['VDATE'].nunique()), "rows": len(history_df)},
         ))
     except Exception as exc:
         stages.append(StageResult(
@@ -668,6 +691,7 @@ def run_pipeline(
             f"skipped ({exc})",
             {"error": str(exc)},
         ))
+    start_nav_eur = _compute_nav_total(start_df)
     period_meta = PeriodMeta(
         fund_name=cfg.fund_name,
         start_date=pd.Timestamp(start_vdate),
@@ -676,12 +700,39 @@ def run_pipeline(
         snapshot_path="ccl.dbo.vw_RPT_VAL @ FCEDATA01",
         bottler_path="ccl.dbo.tTRANS @ FCEDATA01",
         run_timestamp=pipeline_start_time,
-        nav_components=nav_components,
-        nav_total_start=nav_total_start,
         snapshot_exposure=snapshot_exposure,
         ytd_weighted_exposure=ytd_weighted_exposure,
+        start_nav_eur=start_nav_eur,
+        analyst_codes=dict(cfg.analyst_codes),
     )
     ts_str = pipeline_start_time.strftime("%Y%m%d_%H%M%S")
+
+    try:
+        arb_pairs = load_arb_pairs(cfg.arb_pairs_path)
+    except Exception as exc:
+        stages.append(StageResult("load-arb-pairs", False, str(exc)))
+        return _abort("load-arb-pairs")
+
+    try:
+        yahoo_tickers = load_yahoo_ticker_map(cfg.yahoo_tickers_path)
+        stages.append(StageResult(
+            "load-yahoo-tickers", True,
+            f"rows={len(yahoo_tickers)}",
+            {"rows": len(yahoo_tickers)},
+        ))
+    except Exception as exc:
+        yahoo_tickers = {}
+        stages.append(StageResult(
+            "load-yahoo-tickers", True,
+            f"skipped ({exc})",
+            {"error": str(exc)},
+        ))
+
+    try:
+        live_prices_local = fetch_live_prices(arb_pairs, yahoo_tickers=yahoo_tickers)
+        live_prices = _live_prices_to_eur(live_prices_local)
+    except Exception:
+        live_prices = {}
 
     if validation.has_critical:
         failure_parquet = output_dir / f"{FAILURE_PARQUET_PREFIX}{ts_str}.parquet"
@@ -717,6 +768,8 @@ def run_pipeline(
                 trades_df=trades_df.iloc[0:0],
                 validation=validation,
                 period_meta=period_meta,
+                arb_pairs=arb_pairs,
+                live_prices=live_prices,
                 ca_suggestions_path=suggestions_path,
                 applied_ca_overrides=tuple(ca_overrides),
                 ca_override_sources=tuple(
@@ -765,6 +818,8 @@ def run_pipeline(
             out_path=pl_report_path,
             pl_df=pl_df, income_df=income_df, trades_df=trades_df,
             validation=validation, period_meta=period_meta,
+            arb_pairs=arb_pairs,
+            live_prices=live_prices,
             valuation_rows=val_rows,
             applied_ca_overrides=tuple(ca_overrides),
             ca_override_sources=tuple(
@@ -793,7 +848,10 @@ def run_pipeline(
     # embedded directly in the main P&L workbook (Summary + ValuationA +
     # per-analyst sheets), so a duplicate file would only confuse readers.
 
-    # ── 14. Send email (optional) ────────────────────────────────────────────
+    # ── 14a. Write UNASSIGNED CSV (if any) before email sending ─────────────
+    unassigned_path = _write_unassigned_isins(pl_df, output_dir, ts_str, stages)
+
+    # ── 14b. Send email (optional) ───────────────────────────────────────────
     email_result: EmailSendResult | None = None
     if options.send_email:
         email_result = _send_email(
@@ -808,10 +866,22 @@ def run_pipeline(
             {"sent": email_result.sent, "to": email_result.to,
              "attachment_count": email_result.attachment_count},
         ))
+        if unassigned_path is not None:
+            alert_result = _send_unassigned_alert_email(
+                unassigned_csv_path=unassigned_path,
+                period_meta=period_meta,
+                outlook_dispatcher=outlook_dispatcher,
+                from_smtp=options.email_from_smtp,
+            )
+            stages.append(StageResult(
+                "send-unassigned-alert", alert_result.sent,
+                alert_result.error or f"to={alert_result.to}",
+                {"sent": alert_result.sent, "to": alert_result.to,
+                 "attachment_count": alert_result.attachment_count},
+            ))
 
     # ── 15. Save analyst map ─────────────────────────────────────────────────
     _save_analyst_map_safely(analyst_map, stages)
-    unassigned_path = _write_unassigned_isins(pl_df, output_dir, ts_str, stages)
 
     # ── 16. Append applied CA overrides to history (audit + recurrence) ─────
     if ca_overrides:

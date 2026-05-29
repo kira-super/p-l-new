@@ -65,20 +65,13 @@ class PeriodMeta:
     snapshot_path: str = ""
     bottler_path: str = ""
     run_timestamp: datetime = field(default_factory=datetime.now)
-    # Optional NAV reconciliation components (EUR). Ordered tuple of
-    # (label, value, is_total) rows rendered on the Summary sheet. Bridges
-    # the equity-only stock MV to the HP_VAL fund portfolio total.
-    nav_components: tuple[tuple[str, float, bool], ...] | None = None
-    # Optional total NAV at start of period (EUR). When present, the
-    # Summary headline ``Total P&L %`` is reported as Total P&L / NAV start
-    # — the apples-to-apples denominator vs. the firm's TWR dashboard,
-    # which divides the period P&L by starting fund NAV (stocks + cash
-    # − accruals at 31-Dec).
-    nav_total_start: float | None = None
     # Current-snapshot exposure (from end-period HiPort snapshot).
     snapshot_exposure: ExposureBlock | None = None
-    # AUM-weighted daily average exposure over the full period.
+    # Gross-exposure-weighted daily average exposure over the full period.
     ytd_weighted_exposure: ExposureBlock | None = None
+    # Start-of-period fund NAV = sum(PTVALUE_EUR) on the start snapshot.
+    start_nav_eur: float | None = None
+    analyst_codes: dict[str, str] = field(default_factory=dict)
 
 
 # ─── NAV helpers ─────────────────────────────────────────────────────────────
@@ -145,6 +138,21 @@ def compute_nav_total(snap_df: pd.DataFrame) -> float | None:
     return float(pd.to_numeric(snap_df["PTVALUE_EUR"], errors="coerce").fillna(0.0).sum())
 
 
+def compute_daily_nav(history_df: pd.DataFrame) -> pd.Series:
+    """Daily NAV from snapshot history as sum(PTVALUE_EUR) by VDATE.
+
+    Includes all rows for the day (equities, cash, fees, swap P&L, etc.).
+    """
+    if history_df is None or history_df.empty or "PTVALUE_EUR" not in history_df.columns:
+        return pd.Series(dtype=float)
+
+    work = history_df.copy()
+    work["VDATE"] = pd.to_datetime(work["VDATE"], errors="coerce").dt.normalize()
+    work["PTVALUE_EUR"] = pd.to_numeric(work["PTVALUE_EUR"], errors="coerce").fillna(0.0)
+    nav = work.groupby("VDATE", dropna=True)["PTVALUE_EUR"].sum()
+    return nav[nav > 1e-9]
+
+
 # ─── Exposure compute helpers ─────────────────────────────────────────────────
 
 def build_analyst_lookup(pl_df: pd.DataFrame) -> dict[str, dict[str, str]]:
@@ -189,6 +197,22 @@ def snapshot_exposure_magnitude(df: pd.DataFrame) -> pd.Series:
     return exposure.where(use_exposure & exposure.gt(0.0), ptvalue)
 
 
+def _filter_equity_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip non-equity snapshot rows before exposure computation.
+
+    HP_VAL includes cash buckets, FX equivalents, accrued fees, and swap
+    P&L entries alongside equity/CFD positions. These rows have a null or
+    empty ISIN after normalisation. They have no analyst, no meaningful
+    long/short direction, and must not contribute to exposure figures.
+
+    The unfiltered snapshot is still used by compute_nav_components() for
+    the NAV bridge (Stock MV + Cash + Accruals = HP_VAL total).
+    """
+    if df is None or df.empty:
+        return df
+    return df.loc[df["ISIN"].astype(str).str.strip().ne("")]
+
+
 def build_snapshot_exposure(
     snap_df: pd.DataFrame,
     pl_df: pd.DataFrame,
@@ -196,6 +220,10 @@ def build_snapshot_exposure(
 ) -> ExposureBlock:
     """Build point-in-time long/short/net/gross exposure from the end snapshot."""
     if snap_df is None or snap_df.empty:
+        return ExposureBlock(label="Current Snapshot", as_of=as_of)
+
+    snap_df = _filter_equity_rows(snap_df)
+    if snap_df.empty:
         return ExposureBlock(label="Current Snapshot", as_of=as_of)
 
     analyst_keys = build_analyst_lookup(pl_df)
@@ -237,24 +265,48 @@ def build_snapshot_exposure(
 def _aum_weight_metrics(daily_df: pd.DataFrame) -> ExposureMetrics:
     if daily_df.empty:
         return ExposureMetrics()
-    nav = pd.to_numeric(daily_df["NAV_EUR"], errors="coerce").fillna(0.0)
+    long_series = pd.to_numeric(daily_df["long_eur"], errors="coerce").fillna(0.0)
+    short_series = pd.to_numeric(daily_df["short_eur"], errors="coerce").fillna(0.0)
+
+    nav = pd.to_numeric(daily_df.get("NAV_EUR"), errors="coerce")
+    nav_valid = nav[nav.notna() & nav.gt(1e-9)]
+    if nav_valid.empty:
+        # No usable NAV weights: fall back to equal-day averaging so
+        # exposure still reflects the full snapshot history window.
+        return ExposureMetrics(
+            long_eur=float(long_series.mean()),
+            short_eur=float(short_series.mean()),
+            nav_eur=0.0,
+        )
+
+    nav = nav.fillna(float(nav_valid.mean()))
     nav_sum = float(nav.sum())
     if nav_sum <= 1e-9:
-        return ExposureMetrics()
-    long_eur = float(pd.to_numeric(daily_df["long_eur"], errors="coerce").fillna(0.0).mul(nav).sum() / nav_sum)
-    short_eur = float(pd.to_numeric(daily_df["short_eur"], errors="coerce").fillna(0.0).mul(nav).sum() / nav_sum)
-    nav_avg = float(nav.mean())
+        return ExposureMetrics(
+            long_eur=float(long_series.mean()),
+            short_eur=float(short_series.mean()),
+            nav_eur=0.0,
+        )
+    long_eur = float(long_series.mul(nav).sum() / nav_sum)
+    short_eur = float(short_series.mul(nav).sum() / nav_sum)
+    nav_avg = float(nav_valid.mean())
     return ExposureMetrics(long_eur=long_eur, short_eur=short_eur, nav_eur=nav_avg)
 
 
 def build_weighted_exposure(
     history_df: pd.DataFrame,
-    nav_history_df: pd.DataFrame,
     pl_df: pd.DataFrame,
 ) -> ExposureBlock:
-    """AUM-weighted daily average exposure over the pipeline period."""
-    if history_df.empty or nav_history_df.empty:
-        return ExposureBlock(label="YTD AUM-Weighted Average Exposure")
+    """NAV-weighted daily average exposure over the pipeline period."""
+    if history_df.empty:
+        return ExposureBlock(label="YTD Avg Gross Exposure")
+
+    # NAV weighting uses the unfiltered history (cash/accrual rows included).
+    daily_nav = compute_daily_nav(history_df)
+    # Exposure rows must be equity-like rows with a real ISIN.
+    history_df = _filter_equity_rows(history_df)
+    if history_df.empty:
+        return ExposureBlock(label="YTD Avg Gross Exposure")
 
     analyst_keys = build_analyst_lookup(pl_df)
     work = history_df.copy()
@@ -264,17 +316,15 @@ def build_weighted_exposure(
     work["__ANALYST__"] = work.apply(
         lambda row: resolve_snapshot_analyst(row, analyst_keys), axis=1,
     )
-    nav = nav_history_df.copy()
-    nav["VDATE"] = pd.to_datetime(nav["VDATE"], errors="coerce").dt.normalize()
-    nav = nav.groupby("VDATE", as_index=False)["NAV_EUR"].last()
-
     daily_fund = work.groupby("VDATE").apply(
         lambda sub: pd.Series({
             "long_eur": float(sub.loc[~sub["__SHORT__"], "__MAGNITUDE__"].sum()),
             "short_eur": float(sub.loc[sub["__SHORT__"], "__MAGNITUDE__"].sum()),
         })
     ).reset_index()
-    merged_fund = daily_fund.merge(nav, on="VDATE", how="inner")
+    daily_fund["NAV_EUR"] = daily_fund["VDATE"].map(daily_nav)
+    all_dates = pd.Index(daily_fund["VDATE"])
+    merged_fund = daily_fund
     fund_metrics = _aum_weight_metrics(merged_fund)
 
     by_analyst: dict[str, ExposureMetrics] = {}
@@ -286,12 +336,20 @@ def build_weighted_exposure(
                 "short_eur": float(day.loc[day["__SHORT__"], "__MAGNITUDE__"].sum()),
             })
         ).reset_index()
-        merged = daily.merge(nav, on="VDATE", how="inner")
+        daily = (
+            daily
+            .set_index("VDATE")
+            .reindex(all_dates, fill_value=0.0)
+            .rename_axis("VDATE")
+            .reset_index()
+        )
+        daily["NAV_EUR"] = daily["VDATE"].map(daily_nav)
+        merged = daily
         by_analyst[code] = _aum_weight_metrics(merged)
 
     as_of = None if merged_fund.empty else pd.Timestamp(merged_fund["VDATE"].max())
     return ExposureBlock(
-        label="YTD AUM-Weighted Average Exposure",
+        label="YTD Avg Gross Exposure",
         as_of=as_of,
         fund=fund_metrics,
         by_analyst=by_analyst,

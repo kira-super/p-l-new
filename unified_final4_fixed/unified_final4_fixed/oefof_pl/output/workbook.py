@@ -55,9 +55,6 @@ from .styles import (
     COLUMN_LAYOUT_INCOME,
 )
 from .sheets._helpers import (
-    ANALYST_DISPLAY,
-    ANALYST_TAB_ORDER,
-    _analyst_display,
     _analyst_order,
     _current_holdings,
     _exited_positions,
@@ -87,6 +84,29 @@ SHEET_ORDER: tuple[str, ...] = (
 )
 
 
+def _apply_live_price_overrides(
+    pl_df: pd.DataFrame,
+    live_prices: dict[str, float] | None,
+) -> pd.DataFrame:
+    """Overwrite Last Price (EUR) from live price map when available."""
+    if pl_df.empty or not live_prices:
+        return pl_df
+    if "ISIN" not in pl_df.columns or "Last Price (EUR)" not in pl_df.columns:
+        return pl_df
+
+    out = pl_df.copy()
+    price_map = {
+        str(isin).strip().upper(): float(price)
+        for isin, price in live_prices.items()
+        if str(isin).strip()
+    }
+    isin_series = out["ISIN"].astype(str).str.strip().str.upper()
+    mapped = isin_series.map(price_map)
+    has_live = mapped.notna()
+    out.loc[has_live, "Last Price (EUR)"] = mapped.loc[has_live].astype(float)
+    return out
+
+
 # ─── Public entry point ─────────────────────────────────────────────────────
 
 def build_workbook(
@@ -103,10 +123,14 @@ def build_workbook(
     ca_override_sources: tuple = (),        # reserved
     th_val_df: pd.DataFrame | None = None,  # reserved — used by ValuationA TODO
     analyst_sname_overrides: dict | None = None,  # reserved
+    arb_pairs: tuple[dict[str, object], ...] | None = None,
+    live_prices: dict[str, float] | None = None,
 ) -> Path:
     """Build the workbook and atomically rename it into place."""
     out_path = Path(out_path)
     t0 = time.perf_counter()
+
+    pl_df = _apply_live_price_overrides(pl_df, live_prices)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -115,8 +139,15 @@ def build_workbook(
     if valuation_rows:
         _write_valuation_a(wb, valuation_rows, period_meta, pl_df,
                            th_val_df=th_val_df)
-    for analyst_code in _analyst_order(pl_df):
-        _write_analyst_sheet(wb, pl_df, analyst_code, period_meta)
+    for analyst_code in _analyst_order(pl_df, period_meta.analyst_codes):
+        _write_analyst_sheet(
+            wb,
+            pl_df,
+            analyst_code,
+            period_meta,
+            arb_pairs=arb_pairs,
+            live_prices=live_prices,
+        )
     _write_table(wb, "Current Holdings", _current_holdings(pl_df),
                  COLUMN_LAYOUT_HOLDINGS, period_meta,
                  tab_color=COLOR_TAB_DATA)
@@ -140,14 +171,14 @@ def build_workbook(
     _write_validation(wb, validation, period_meta, elapsed,
                       ca_suggestions_path=ca_suggestions_path)
 
-    _enforce_sheet_order(wb)
+    _enforce_sheet_order(wb, period_meta.analyst_codes)
     _atomic_save(wb, out_path)
     return out_path
 
 
 # ─── Sheet ordering / atomic save ───────────────────────────────────────────
 
-def _enforce_sheet_order(wb: Workbook) -> None:
+def _enforce_sheet_order(wb: Workbook, analyst_codes: dict[str, str]) -> None:
     """Order: Summary, ValuationA?, <analysts...>,
     Current Holdings, Exited Positions, Income & Dividends, Income Detail,
     Trade Detail, Validation Report, Methodology.
@@ -158,9 +189,9 @@ def _enforce_sheet_order(wb: Workbook) -> None:
         desired.append("ValuationA")
     known_static = set(SHEET_ORDER) | {"ValuationA"}
     analyst_sheets = [s for s in wb.sheetnames if s not in known_static]
-    display_order = [_analyst_display(c) for c in ANALYST_TAB_ORDER]
+    code_order = list(analyst_codes.keys())
     analyst_sheets.sort(key=lambda s: (
-        display_order.index(s) if s in display_order else len(display_order),
+        code_order.index(s) if s in code_order else len(code_order),
         s,
     ))
     desired.extend(analyst_sheets)

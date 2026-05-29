@@ -93,20 +93,24 @@ def test_empty_isin_dropped():
 
 def test_cat_fut_escalates_when_any_row_is_fut():
     """Vietnam Dairy hybrid: ORD line + FUT line on same ISIN.
-    The ISIN must end up classified FUT, not ORD."""
+    Mixed groups now split into separate ORD and FUT keys."""
     df = _port([
         {"ISIN": "VN-DAIRY", "CAT": "ORD", "UNITS": 100},
         {"ISIN": "VN-DAIRY", "CAT": "FUT", "UNITS": 50},
     ])
     out = aggregate_portfolio(df)
-    assert out["VN-DAIRY"].cat == "FUT"
+    assert out["VN-DAIRY"].cat == "ORD"
+    assert out["VN-DAIRY:FUT"].cat == "FUT"
 
 
 def test_cat_fut_escalation_independent_of_row_order():
     df_a = _port([{"ISIN": "X", "CAT": "FUT"}, {"ISIN": "X", "CAT": "ORD"}])
     df_b = _port([{"ISIN": "X", "CAT": "ORD"}, {"ISIN": "X", "CAT": "FUT"}])
-    assert aggregate_portfolio(df_a)["X"].cat == "FUT"
-    assert aggregate_portfolio(df_b)["X"].cat == "FUT"
+    out_a = aggregate_portfolio(df_a)
+    out_b = aggregate_portfolio(df_b)
+    for out in (out_a, out_b):
+        assert out["X"].cat == "ORD"
+        assert out["X:FUT"].cat == "FUT"
 
 
 def test_cat_blank_falls_back_to_ord():

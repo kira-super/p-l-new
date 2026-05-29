@@ -27,6 +27,7 @@ from ..styles import (
 from ._helpers import (
     _analyst_display,
     _analyst_order,
+    _normalise_analyst_code,
     _coerce_value,
     _current_holdings,
     _exited_positions,
@@ -60,8 +61,9 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
     fund_kpi = _exposure_for(pl_df)
     cur_kpi = _exposure_for(current)
     ex_kpi = _exposure_for(exited)
+    ytd_exp = meta.ytd_weighted_exposure
 
-    card_rows = (4, 6, 8, 10)
+    card_rows = (4, 6, 8)
     card_cols = (1, 3, 5)
 
     cards = [
@@ -75,7 +77,6 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
 
         ("FX Attribution (EUR)", fund_kpi["fx_attrib"], "eur", True, False),
         ("Total P&L (EUR)", fund_kpi["total"], "eur", True, True),
-        ("Total P&L %", fund_kpi["total_pct"], "pct", True, True),
     ]
     for i, (label, value, kind, signed, accent) in enumerate(cards):
         r = card_rows[i // 3]
@@ -84,48 +85,11 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
                   kind=kind, colour_signed=signed, accent=accent)
 
     base_row = card_rows[-1] + 3
-    _write_section_header(ws, base_row, title="Instrument Breakdown",
-                          span_cols=4)
-    base_row += 1
-
-    inst_headers = ("Type", "Positions", f"Total P&L ({meta.fund_currency})", "Total P&L %")
-    inst_kinds = ("text", "int", "eur", "pct")
-    for i, h in enumerate(inst_headers, start=1):
-        cc = ws.cell(base_row, i, h); cc.font = FONT_HEADER
-        cc.fill = FILL_HEADER; cc.alignment = ALIGN_CENTER
-    base_row += 1
-    g = pl_df.groupby("Instrument", sort=False)
-    rows: list[tuple] = []
-    for inst, sub in g:
-        e = _exposure_for(sub)
-        rows.append((str(inst), e["n"], e["total"], e["total_pct"]))
-    rows.append(("TOTAL", fund_kpi["n"], fund_kpi["total"], fund_kpi["total_pct"]))
-    for r_idx, row in enumerate(rows):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws.cell(base_row + r_idx, c_idx,
-                           _coerce_value(val, inst_kinds[c_idx - 1]))
-            kind = inst_kinds[c_idx - 1]
-            if r_idx == len(rows) - 1:
-                cell.font = FONT_TOTAL
-                cell.fill = FILL_TOTAL
-            else:
-                cell.font = FONT_BODY
-                if r_idx % 2 == 1:
-                    cell.fill = FILL_BAND
-            cell.alignment = align_for(kind)
-            if kind != "text":
-                cell.number_format = fmt_for(kind)
-            if kind in ("eur", "pct") and isinstance(cell.value, (int, float)) and cell.value < 0:
-                cell.font = FONT_NEG_BOLD if cell.font is FONT_TOTAL else FONT_NEG
-    ws.row_dimensions[base_row - 1].height = 22
-
-    base_row = base_row + len(rows) + 1
     _write_section_header(ws, base_row,
                           title="By Analyst — Period P&L Attribution (YTD)",
                           span_cols=8, accent=True)
     base_row += 1
 
-    ytd_exp = meta.ytd_weighted_exposure
     ret_pct_label = ("Return % (YTD Gross Exp)" if ytd_exp is not None
                      else "Total P&L % (Cost Basis)")
     a_headers = ("Analyst", "Open Positions",
@@ -145,12 +109,13 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
         return None
 
     a_rows_with_codes: list[tuple[str, tuple]] = []
-    for code in _analyst_order(pl_df):
-        sub = pl_df[pl_df["Analyst"].astype(str).str.upper() == code]
+    for code in _analyst_order(pl_df, meta.analyst_codes):
+        analyst_codes = pl_df["Analyst"].map(_normalise_analyst_code)
+        sub = pl_df[analyst_codes == code]
         cur_sub = sub[sub["Ending Units"] != 0]
         e = _exposure_for(sub)
         ret = _ret_pct(e["total"], code) if ytd_exp is not None else e["total_pct"]
-        row = (_analyst_display(code), int(len(cur_sub)),
+        row = (_analyst_display(code, meta.analyst_codes), int(len(cur_sub)),
                e["total"], ret,
                e["realised"], e["unrealised"], e["income"], e["fx_attrib"])
         a_rows_with_codes.append((code, row))
@@ -204,28 +169,47 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
                 ).font = FONT_BODY_MUTED
         sec_row += 2
     if meta.ytd_weighted_exposure is not None:
+        ytd_fund_gross = meta.ytd_weighted_exposure.fund.gross_eur
         sec_row = _write_exposure_block_table(
-            ws, meta.ytd_weighted_exposure, analysts, meta, start_row=sec_row, is_ytd=True,
+            ws,
+            meta.ytd_weighted_exposure,
+            analysts,
+            meta,
+            start_row=sec_row,
+            is_ytd=True,
+            pct_denominator=ytd_fund_gross if abs(ytd_fund_gross) > 1e-9 else None,
         ) + 1
         _write_section_header(ws, sec_row, title="Return on Gross Exposure (YTD)",
-                              span_cols=4)
+                              span_cols=5)
         sec_row += 1
-        ren_hdrs = ("Analyst", "Total P&L (EUR)", "YTD Avg Gross Exp (EUR)", "Return %")
-        ren_kinds = ("text", "eur", "eur", "pct")
+        ren_hdrs = (
+            "Analyst",
+            "Total P&L (EUR)",
+            "YTD Avg Gross Exp (EUR)",
+            "Return %",
+            "Contribution to Fund Return",
+        )
+        ren_kinds = ("text", "eur", "eur", "pct", "pct")
         for i, h in enumerate(ren_hdrs, start=1):
             cc = ws.cell(sec_row, i, h)
             cc.font = FONT_HEADER; cc.fill = FILL_HEADER; cc.alignment = ALIGN_CENTER
         sec_row += 1
         ytd = meta.ytd_weighted_exposure
+        fund_gross_eur = ytd.fund.gross_eur
+        fund_total_pl = fund_kpi["total"]
 
-        ren_rows: list[tuple[str, float, float, float | None]] = []
+        ren_rows: list[tuple[str, float, float, float | None, float | None]] = []
         for code in analysts:
-            sub = pl_df[pl_df["Analyst"].astype(str).str.upper() == code]
+            analyst_codes = pl_df["Analyst"].map(_normalise_analyst_code)
+            sub = pl_df[analyst_codes == code]
             pl_total = float(pd.to_numeric(sub.get("Total P&L (EUR)", 0.0),
                                            errors="coerce").fillna(0.0).sum())
             em = ytd.by_analyst.get(code, ExposureMetrics())
             ret = _pct_or_none(pl_total, em.gross_eur) if abs(em.gross_eur) > 1e-9 else None
-            ren_rows.append((_analyst_display(code), pl_total, em.gross_eur, ret))
+            fund_weighted_ret = (
+                _pct_or_none(pl_total, fund_total_pl) if abs(fund_total_pl) > 1e-9 else None
+            )
+            ren_rows.append((_analyst_display(code, meta.analyst_codes), pl_total, em.gross_eur, ret, fund_weighted_ret))
 
         ren_rows.sort(key=lambda x: (x[3] is None, -x[3] if x[3] is not None else 0))
 
@@ -243,9 +227,12 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
 
         pl_fund = fund_kpi["total"]
         em_fund = ytd.fund
-        ret_fund = _pct_or_none(pl_fund, em_fund.gross_eur) if abs(em_fund.gross_eur) > 1e-9 else None
+        ret_fund = None
+        fund_weighted_ret_fund = (
+            _pct_or_none(pl_fund, fund_total_pl) if abs(fund_total_pl) > 1e-9 else None
+        )
         for c_idx, (v, k) in enumerate(zip(
-            ("TOTAL", pl_fund, em_fund.gross_eur, ret_fund), ren_kinds
+            ("TOTAL", pl_fund, em_fund.gross_eur, ret_fund, fund_weighted_ret_fund), ren_kinds
         ), start=1):
             cell = ws.cell(sec_row + len(ren_rows), c_idx, _coerce_value(v, k))
             cell.font = FONT_TOTAL; cell.fill = FILL_TOTAL
@@ -257,8 +244,7 @@ def _write_summary(wb: Workbook, pl_df: pd.DataFrame, income_df: pd.DataFrame,
         sec_row += len(ren_rows) + 2
     elif meta.snapshot_exposure is not None:
         ws.cell(sec_row, 1,
-                "YTD AUM-weighted exposure unavailable — NAV history not loaded "
-                "(run with SQL access to NAV.dbo.tNAV)."
+            "YTD gross-exposure history unavailable — snapshot history not loaded."
                 ).font = FONT_BODY_MUTED
         sec_row += 2
 

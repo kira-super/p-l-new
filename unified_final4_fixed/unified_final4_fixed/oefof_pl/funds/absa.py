@@ -55,10 +55,6 @@ FTSWAP_ISINS: frozenset[str] = frozenset()
 PERSON_OVERRIDES_BY_SECURITY: dict[str, str] = {}
 
 
-# ─── NAV source ───────────────────────────────────────────────────────────────
-NAV_PCODE_PATTERN = os.environ.get("ABSA_NAV_PCODE_PATTERN", "ABSA%")
-
-
 # ─── Fund identity ────────────────────────────────────────────────────────────
 FUND_NAME = "ABSA Fund"
 FUND_CURRENCY = os.environ.get("ABSA_FUND_CURRENCY", "USD").strip().upper() or "USD"
@@ -86,7 +82,6 @@ def load_config() -> Config:
         ftswap_isins=FTSWAP_ISINS,
         analyst_codes=dict(ANALYST_CODES),
         person_overrides=dict(PERSON_OVERRIDES_BY_SECURITY),
-        nav_pcode_pattern=NAV_PCODE_PATTERN,
         fund_name=FUND_NAME,
         fund_currency=FUND_CURRENCY,
         pl_report_filename=PL_REPORT_FILENAME,

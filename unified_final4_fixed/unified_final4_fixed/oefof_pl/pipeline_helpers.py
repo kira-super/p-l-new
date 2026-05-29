@@ -40,6 +40,9 @@ from .output.valuation import (
 from .pipeline_types import PipelineOptions, StageResult
 
 
+UNASSIGNED_ALERT_TO = "kgontar@fieracapital.com"
+
+
 # ─── Date utilities ──────────────────────────────────────────────────────────
 
 def to_yyyymmdd(ts: pd.Timestamp) -> str:
@@ -389,6 +392,46 @@ def send_email(
         to=to, cc=cc, subject=subject,
         body_text=options.email_body, body_html=html_body,
         attachments=attachments, from_smtp=options.email_from_smtp,
+    )
+    kwargs = {}
+    if outlook_dispatcher is not None:
+        kwargs["dispatcher"] = outlook_dispatcher
+    return send_via_outlook(msg, **kwargs)
+
+
+def send_unassigned_alert_email(
+    *,
+    unassigned_csv_path: Path,
+    period_meta: PeriodMeta,
+    outlook_dispatcher,
+    from_smtp: str = "",
+) -> EmailSendResult:
+    """Send a dedicated alert when unassigned positions are present."""
+    rows = 0
+    try:
+        with unassigned_csv_path.open("r", encoding="utf-8") as fh:
+            rows = max(0, sum(1 for _ in fh) - 1)
+    except Exception:
+        rows = 0
+
+    subject = (
+        f"UNASSIGNED positions detected — "
+        f"{period_meta.end_date:%Y-%m-%d} ({rows} rows)"
+    )
+    body = (
+        "The P&L pipeline detected UNASSIGNED analyst rows.\n\n"
+        f"Rows: {rows}\n"
+        f"File: {unassigned_csv_path}\n"
+        f"Period: {period_meta.start_date.date()} -> {period_meta.end_date.date()}\n\n"
+        "Please update analyst mapping and re-run if needed."
+    )
+    msg = EmailMessage(
+        to=UNASSIGNED_ALERT_TO,
+        subject=subject,
+        body_text=body,
+        body_html=build_email_html_body(body, None),
+        attachments=(unassigned_csv_path.resolve(),),
+        from_smtp=from_smtp,
     )
     kwargs = {}
     if outlook_dispatcher is not None:

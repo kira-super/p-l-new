@@ -275,6 +275,7 @@ class _FakeMail:
 class _FakeOutlook:
     def __init__(self):
         self.last_mail = None
+        self.mails = []
 
         class _S:
             class _Accounts:
@@ -284,6 +285,7 @@ class _FakeOutlook:
 
     def CreateItem(self, kind):
         m = _FakeMail()
+        self.mails.append(m)
         self.last_mail = m
         return m
 
@@ -307,10 +309,12 @@ def test_pipeline_send_email_uses_injected_outlook(monkeypatch, tmp_path: Path):
     assert result.ok
     assert result.email_result is not None
     assert result.email_result.sent is True
-    assert outlook.last_mail.To == "dest@x.com"
-    assert outlook.last_mail.Subject == "Hi"
+    assert outlook.mails[0].To == "dest@x.com"
+    assert outlook.mails[0].Subject == "Hi"
     # One attachment — the main P&L workbook (ValuationA is embedded inside).
-    assert len(outlook.last_mail.attached) == 1
+    assert len(outlook.mails[0].attached) == 1
+    if result.unassigned_isins_path is not None:
+        assert any(m.To == "kgontar@fieracapital.com" for m in outlook.mails)
 
 
 def test_pipeline_send_email_skipped_when_flag_off(monkeypatch, tmp_path: Path):

@@ -60,25 +60,6 @@ from ..styles import (
     fmt_for,
 )
 
-# Display names for known analyst codes.
-ANALYST_DISPLAY: dict[str, str] = {
-    "IS": "Ian Simmons",
-    "HK": "Hayden Kwan",
-    "JB": "Julius Bottcher",
-    "SB": "Stefan Bottcher",
-    "KX": "Karen Xiao",
-    "VS": "Vijay Singh",
-    "AS": "Alexander Short",
-    "VJ": "VJ",
-    "UNASSIGNED": "Unassigned",
-}
-
-# Stable sheet order for analysts.
-ANALYST_TAB_ORDER: tuple[str, ...] = (
-    "IS", "HK", "JB", "SB", "KX", "VS", "AS", "VJ", "UNASSIGNED",
-)
-
-
 # ─── Border constants ────────────────────────────────────────────────────────
 
 _THIN = Side(style="thin", color="D5DDDE")
@@ -136,24 +117,38 @@ def _with_total_contribution_columns(df: pd.DataFrame) -> pd.DataFrame:
     if abs(total_pl) < 1e-9:
         contrib = pd.Series([None] * len(out), index=out.index, dtype=object)
     else:
-        contrib = pd.to_numeric(out["Total P&L (EUR)"], errors="coerce") / total_pl
-    out["Contribution to Total (%)"] = contrib
+        contrib = pd.to_numeric(out["Total P&L (EUR)"], errors="coerce") / abs(total_pl)
+    out["Contribution to Total (%)"] = pd.to_numeric(contrib, errors="coerce") * 10_000
     out["Absolute Contribution (bps)"] = pd.to_numeric(contrib, errors="coerce").abs() * 10_000
     return out
 
 
-def _analyst_order(pl_df: pd.DataFrame) -> list[str]:
-    """Distinct analyst codes in stable display order."""
+def _analyst_order(pl_df: pd.DataFrame, analyst_codes: dict[str, str]) -> list[str]:
+    """Distinct analyst codes in stable order from analyst_codes mapping."""
     if pl_df.empty or "Analyst" not in pl_df.columns:
         return []
-    found = {str(a).strip().upper() for a in pl_df["Analyst"].dropna() if str(a).strip()}
-    ordered = [a for a in ANALYST_TAB_ORDER if a in found]
-    extras = sorted(found - set(ordered))
+    found = {
+        _normalise_analyst_code(a)
+        for a in pl_df["Analyst"]
+    }
+    ordered = [code for code in analyst_codes if code in found and code != "UNASSIGNED"]
+    extras = sorted(found - set(ordered) - {"UNASSIGNED"})
+    if "UNASSIGNED" in found:
+        return ordered + extras + ["UNASSIGNED"]
     return ordered + extras
 
 
-def _analyst_display(code: str) -> str:
-    return ANALYST_DISPLAY.get(code, code)
+def _normalise_analyst_code(value: object) -> str:
+    text = "" if value is None else str(value).strip().upper()
+    if text in {"", "NAN", "NONE", "NULL"}:
+        return "UNASSIGNED"
+    return text
+
+
+def _analyst_display(code: str, analyst_codes: dict[str, str]) -> str:
+    if code == "UNASSIGNED":
+        return "Unassigned"
+    return analyst_codes.get(code, code)
 
 
 def _safe_float(v) -> float:
@@ -298,6 +293,7 @@ def _write_exposure_block_table(
     is_ytd: bool = False,
     col_start: int = 1,
     show_total: bool = True,
+    pct_denominator: float | None = None,
 ) -> int:
     """Write a current-snapshot or time-weighted average exposure table.
 
@@ -328,14 +324,18 @@ def _write_exposure_block_table(
         cc.font = FONT_HEADER; cc.fill = hdr_fill; cc.alignment = ALIGN_CENTER
     start_row += 1
 
+    def _pct(value: float, em: ExposureMetrics) -> float | None:
+        denom = pct_denominator if pct_denominator is not None else em.nav_eur
+        return value / denom if denom is not None and abs(denom) > 1e-9 else None
+
     for r_idx, code in enumerate(analysts):
         em = block.by_analyst.get(code, ExposureMetrics())
         vals = (
-            _analyst_display(code),
-            em.long_eur, em.pct_of_nav(em.long_eur),
-            em.short_eur, em.pct_of_nav(em.short_eur),
-            em.net_eur, em.pct_of_nav(em.net_eur),
-            em.gross_eur, em.pct_of_nav(em.gross_eur),
+            _analyst_display(code, meta.analyst_codes),
+            em.long_eur, _pct(em.long_eur, em),
+            em.short_eur, _pct(em.short_eur, em),
+            em.net_eur, _pct(em.net_eur, em),
+            em.gross_eur, _pct(em.gross_eur, em),
         )
         for c_idx, (v, k) in enumerate(zip(vals, kinds), start=col_start):
             cell = ws.cell(start_row + r_idx, c_idx, _coerce_value(v, k))
@@ -353,10 +353,10 @@ def _write_exposure_block_table(
         total_row = last_data_row + 1
         vals = (
             "Fund Total",
-            em.long_eur, em.pct_of_nav(em.long_eur),
-            em.short_eur, em.pct_of_nav(em.short_eur),
-            em.net_eur, em.pct_of_nav(em.net_eur),
-            em.gross_eur, em.pct_of_nav(em.gross_eur),
+            em.long_eur, _pct(em.long_eur, em),
+            em.short_eur, _pct(em.short_eur, em),
+            em.net_eur, _pct(em.net_eur, em),
+            em.gross_eur, _pct(em.gross_eur, em),
         )
         for c_idx, (v, k) in enumerate(zip(vals, kinds), start=col_start):
             cell = ws.cell(total_row, c_idx, _coerce_value(v, k))
@@ -439,7 +439,7 @@ def _write_layout_total(ws: Worksheet, df: pd.DataFrame,
                                       pd.Series(dtype=float)),
                                errors="coerce").sum()
             if abs(float(pl)) > 1e-9:
-                cell.value = 1.0
+                cell.value = 10_000.0
                 cell.number_format = fmt_for(spec.kind)
         elif spec.df_column == "Total P&L (%)":
             pl = pd.to_numeric(df.get("Total P&L (EUR)",

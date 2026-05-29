@@ -4,6 +4,7 @@ from __future__ import annotations
 import pandas as pd
 from openpyxl import Workbook
 
+from ...compute.pairs import compute_pair_metrics
 from ...compute.exposure import ExposureMetrics, PeriodMeta
 from ..styles import (
     ALIGN_CENTER,
@@ -16,14 +17,13 @@ from ..styles import (
 )
 from ._helpers import (
     _analyst_display,
-    _coerce_value,
     _exposure_for,
     _kpi_card,
+    _normalise_analyst_code,
     _pct_or_none,
     _safe_sheet_name,
     _setup_sheet,
     _with_total_contribution_columns,
-    _write_exposure_block_table,
     _write_layout_data,
     _write_layout_headers,
     _write_layout_total,
@@ -31,20 +31,28 @@ from ._helpers import (
     _write_title_block,
     get_column_letter,
 )
+from .pairs_section import write_pairs_section
 
 
-def _write_analyst_sheet(wb: Workbook, pl_df: pd.DataFrame,
-                         analyst_code: str, meta: PeriodMeta) -> None:
+def _write_analyst_sheet(
+    wb: Workbook,
+    pl_df: pd.DataFrame,
+    analyst_code: str,
+    meta: PeriodMeta,
+    arb_pairs: tuple[dict[str, object], ...] | None = None,
+    live_prices: dict[str, float] | None = None,
+) -> None:
     name = _safe_sheet_name(analyst_code)
     ws = wb.create_sheet(name)
     _setup_sheet(ws, tab_color=COLOR_TAB_ANALYST, zoom=100)
     _write_title_block(ws, meta,
-                       title=f"Analyst: {_analyst_display(analyst_code)} ({analyst_code})",
+                       title=f"Analyst: {_analyst_display(analyst_code, meta.analyst_codes)} ({analyst_code})",
                        subtitle=(f"Period: {meta.start_date.date():%d %B %Y} → "
                                  f"{meta.end_date.date():%d %B %Y}  |  Fund Currency: EUR"),
                        col_start=2)
 
-    sub = pl_df[pl_df["Analyst"].astype(str).str.upper() == analyst_code].copy()
+    analyst_codes = pl_df["Analyst"].map(_normalise_analyst_code)
+    sub = pl_df[analyst_codes == analyst_code].copy()
     cur = sub[sub["Ending Units"] != 0].reset_index(drop=True)
     exi = sub[sub["Ending Units"] == 0].reset_index(drop=True)
 
@@ -85,13 +93,11 @@ def _write_analyst_sheet(wb: Workbook, pl_df: pd.DataFrame,
               value=int(len(cur)), kind="int", accent=False)
     _kpi_card(ws, row=kpi_row, col=4, label="Period — Total P&L (EUR)",
               value=e["total"], kind="eur", colour_signed=True, accent=True)
-    _kpi_card(ws, row=kpi_row, col=6, label="Period — Total P&L %",
-              value=e["total_pct"], kind="pct", colour_signed=True, accent=True)
-    _kpi_card(ws, row=kpi_row, col=8, label="Return on Gross Exposure (YTD)",
+    _kpi_card(ws, row=kpi_row, col=6, label="Return on Gross Exposure (YTD)",
               value=ret_on_gross_ytd, kind="pct", colour_signed=True, accent=True)
-    _kpi_card(ws, row=kpi_row, col=10, label="Current — Net Exposure (EUR)",
+    _kpi_card(ws, row=kpi_row, col=8, label="Current — Net Exposure (EUR)",
               value=e_cur["net_eur"], kind="eur", accent=False)
-    _kpi_card(ws, row=kpi_row, col=12, label="Current — Gross Exposure (EUR)",
+    _kpi_card(ws, row=kpi_row, col=10, label="Current — Gross Exposure (EUR)",
               value=e_cur["gross_eur"], kind="eur", accent=False)
 
     visible_span = n_cols - 1
@@ -152,15 +158,7 @@ def _write_analyst_sheet(wb: Workbook, pl_df: pd.DataFrame,
                                     suppress=TOTAL_SUPPRESS)
 
     next_row += 2
-    if meta.snapshot_exposure is not None:
-        next_row = _write_exposure_block_table(
-            ws, meta.snapshot_exposure, [analyst_code],
-            meta,
-            start_row=next_row, is_ytd=False, col_start=2, show_total=False,
-        ) + 1
-    if meta.ytd_weighted_exposure is not None:
-        next_row = _write_exposure_block_table(
-            ws, meta.ytd_weighted_exposure, [analyst_code],
-            meta,
-            start_row=next_row, is_ytd=True, col_start=2, show_total=False,
-        ) + 1
+
+    if arb_pairs:
+        pair_metrics = compute_pair_metrics(pl_df, arb_pairs, live_prices=live_prices)
+        next_row = write_pairs_section(ws, pair_metrics, analyst_code, next_row, col_start=2)

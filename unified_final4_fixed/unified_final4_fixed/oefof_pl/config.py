@@ -13,7 +13,7 @@ All constants below reflect decisions recorded in DESIGN.md §18 (resolved
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -39,6 +39,8 @@ def _env_bool(name: str, default: bool) -> bool:
 # the workbook header; nothing on disk is read from it.
 BOTTLER_PATH = Path("inputs/StockTrList.xlsb")
 ANALYST_MAP_PATH = Path("isin_analyst_map.csv")
+ARB_PAIRS_PATH = Path(__file__).parent / "data" / "arb_pairs.csv"
+YAHOO_TICKERS_PATH = Path(__file__).parent / "data" / "yahoo_tickers.csv"
 CA_OVERRIDES_PATH = Path("inputs/ca_overrides.csv")
 CA_HISTORY_PATH = Path("inputs/ca_overrides_history.csv")
 CA_BONUS_PRICES_PATH = Path("inputs/ca_bonus_prices.csv")
@@ -64,11 +66,6 @@ SQL_CONN_STR_DEFAULT = (
     "TrustServerCertificate=yes;"
 )
 SQL_CONN_STR = os.environ.get("OEFOF_SQL_CONN", SQL_CONN_STR_DEFAULT)
-NAV_SQL_TABLE = os.environ.get("OEFOF_NAV_SQL_TABLE", "NAV.dbo.tNAV")
-NAV_PCODE_COLUMN = os.environ.get("OEFOF_NAV_PCODE_COLUMN", "PCODE")
-NAV_PCODE_PATTERN = os.environ.get("OEFOF_NAV_PCODE_PATTERN", "OEFOF%")
-NAV_VDATE_COLUMN = os.environ.get("OEFOF_NAV_VDATE_COLUMN", "vDATE")
-NAV_VALUE_COLUMN = os.environ.get("OEFOF_NAV_VALUE_COLUMN", "MKTCAP")
 
 
 # ─── Year-to-date anchor ─────────────────────────────────────────────────────
@@ -139,7 +136,7 @@ PERSON_OVERRIDES_BY_SECURITY: dict[str, str] = {}
 
 # ─── Email defaults ──────────────────────────────────────────────────────────
 # Decision §18 Q6: production recipient is oaks@fieracapital.com.
-EMAIL_TO_DEFAULT = "oaks@fieracapital.com"
+EMAIL_TO_DEFAULT = "kgontar@fieracapital.com"
 EMAIL_SUBJECT_DEFAULT = "OEFOF ValuationA and P&L (inc per analyst)"
 
 
@@ -160,17 +157,14 @@ class Config:
 
     bottler_path: Path
     analyst_map_path: Path
+    arb_pairs_path: Path
+    yahoo_tickers_path: Path
     ca_overrides_path: Path
     ca_history_path: Path
     ca_bonus_prices_path: Path
     output_dir: Path
     report_archive_root: Path
     sql_conn_str: str
-    nav_sql_table: str
-    nav_pcode_column: str
-    nav_pcode_pattern: str
-    nav_vdate_column: str
-    nav_value_column: str
 
     fund_pcodes: tuple[str, ...]        # was oefof_pcodes
     ftswap_isins: frozenset[str]
@@ -197,17 +191,14 @@ def load_default_config() -> Config:
     return Config(
         bottler_path=BOTTLER_PATH,
         analyst_map_path=ANALYST_MAP_PATH,
+        arb_pairs_path=ARB_PAIRS_PATH,
+        yahoo_tickers_path=YAHOO_TICKERS_PATH,
         ca_overrides_path=CA_OVERRIDES_PATH,
         ca_history_path=CA_HISTORY_PATH,
         ca_bonus_prices_path=CA_BONUS_PRICES_PATH,
         output_dir=OUTPUT_DIR,
         report_archive_root=REPORT_ARCHIVE_ROOT,
         sql_conn_str=SQL_CONN_STR,
-        nav_sql_table=NAV_SQL_TABLE,
-        nav_pcode_column=NAV_PCODE_COLUMN,
-        nav_pcode_pattern=NAV_PCODE_PATTERN,
-        nav_vdate_column=NAV_VDATE_COLUMN,
-        nav_value_column=NAV_VALUE_COLUMN,
         fund_pcodes=OEFOF_PCODES,
         fund_currency="EUR",
         fund_name=TARGET_PNAME,

@@ -64,10 +64,10 @@ def test_resolve_unknown_records_when_requested(tmp_path: Path):
     assert m.dirty
 
 
-def test_repo_map_contains_time_interconnect():
+def test_repo_map_contains_known_isin_mapping():
     repo_map = Path(__file__).resolve().parents[1] / "isin_analyst_map.csv"
     m = AnalystMap.load(repo_map)
-    assert m.resolve("HK0000536843") == "IS"
+    assert m.resolve("KYG070341048") == "HK"
 
 
 def test_sname_override_takes_priority_over_csv(tmp_path: Path):
