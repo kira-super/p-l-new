@@ -5,6 +5,83 @@ import pandas as pd
 import requests
 
 warnings.filterwarnings("ignore")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Verified hard overrides for Google Finance tickers where name-based guessing fails.
+ISIN_TO_GOOGLE_TICKER = {
+    # UAE (ADX/DFM)
+    "AEA000201011": "ADX:ADCB",
+    "AEA000801018": "ADX:ADIB",
+    "AEN000101016": "ADX:FAB",
+    "AEA006101017": "ADX:ADNOCDRILL",
+    "AEA007501017": "ADX:YAHSAT",
+    "AEE000401019": "ADX:EAND",
+    "AEE01195A234": "ADX:ADNOCGAS",
+    "AEE01268A239": "ADX:ADNOCLS",
+    "AEE01135A222": "ADX:AMERICANA",
+    "AEF000901015": "ADX:FERTIGLOBE",
+    "AEE01356D236": "DFM:DUBAITAXI",
+    "AEE01377S248": "DFM:SPINNEYS",
+    "AEE01110S227": "DFM:SALIK",
+    "AEE01134E227": "DFM:EMPOWER",
+    # Saudi (Tadawul)
+    "SA16CI8KMOH3": "TADAWUL:9649",
+    "SA15M1HH2NH5": "TADAWUL:2222",
+    "SA15T1L22JH8": "TADAWUL:1831",
+    "SA15ED94KR18": "TADAWUL:9543",
+    "SA165I21VPH1": "TADAWUL:4083",
+    "SA1610O13M15": "TADAWUL:2100",
+    "SA154HG210H6": "TADAWUL:4161",
+    "SA15LGLI0N19": "TADAWUL:4110",
+    # HK / India / Poland / Vietnam
+    "KYG070341048": "HKG:9888",
+    "KYG371091086": "HKG:1448",
+    "CNE100004272": "HKG:9633",
+    "INE474Q01031": "NSE:MEDANTA",
+    "INE066P01011": "NSE:INOXWIND",
+    "VN000000FPT1": "HOSE:FPT",
+    "VN000000SSI1": "HOSE:SSI",
+    "PLBNFTS00018": "WSE:BFT",
+    "PLDINPL00011": "WSE:DNP",
+}
+
+
+def infer_google_ticker(isin: str, security_name: str, yahoo_ticker: str) -> str:
+    """Returns the best Google ticker candidate for an instrument."""
+    if isin in ISIN_TO_GOOGLE_TICKER:
+        return ISIN_TO_GOOGLE_TICKER[isin]
+
+    ticker = "" if pd.isna(yahoo_ticker) else str(yahoo_ticker).strip()
+    if ticker:
+        suffix_to_exchange = {
+            ".HK": "HKG",
+            ".NS": "NSE",
+            ".SA": "BVMF",
+            ".BO": "BSE",
+            ".WA": "WSE",
+        }
+        for suffix, exchange in suffix_to_exchange.items():
+            if ticker.endswith(suffix):
+                base_symbol = ticker[: -len(suffix)]
+                return f"{exchange}:{base_symbol}"
+
+    # Avoid incorrect first-word guessing for UAE names (e.g., ADX:FIRST / ADX:ABU).
+    if isin.startswith(("AEA", "AEE", "AEN", "AEF")):
+        return ""
+
+    if isin.startswith("SA"):
+        numeric_code = re.findall(r"\d+", ticker)
+        return f"TADAWUL:{numeric_code[0]}" if numeric_code else ""
+
+    if isin.startswith("PHY"):
+        first_word = str(security_name).split()[0] if str(security_name).split() else ""
+        return f"PSE:{first_word}" if first_word else ""
+
+    if isin.startswith("PL"):
+        first_word = str(security_name).split()[0] if str(security_name).split() else ""
+        return f"WSE:{first_word}" if first_word else ""
+
+    return ""
 
 def fetch_yahoo_historical_close(ticker: str, target_date: str) -> float | None:
     """Queries Yahoo Finance for the closing price on the target date."""
@@ -29,16 +106,20 @@ def build_comparison_analysis():
     print("        OAKS UNIVERSE MULTI-SOURCE PRICE VARIANCE ENGINE")
     print("=" * 80)
 
-    # Validate asset files inside the running subfolder
-    if not os.path.exists("hiport_all_isins.csv"):
-        print("[CRITICAL] Run the engine inside 'unified_final4_live_prices' containing 'hiport_all_isins.csv'.")
+    hiport_path = os.path.join(BASE_DIR, "hiport_all_isins.csv")
+    ticker_map_path = os.path.join(BASE_DIR, "oefof_pl", "data", "yahoo_tickers.csv")
+    out_dir = os.path.join(BASE_DIR, "out")
+
+    # Validate required assets relative to the script location
+    if not os.path.exists(hiport_path):
+        print(f"[CRITICAL] Missing required input file: {hiport_path}")
         return
 
-    hiport_df = pd.read_csv("hiport_all_isins.csv")
+    hiport_df = pd.read_csv(hiport_path)
     
     ticker_map = {}
-    if os.path.exists("oefof_pl/data/yahoo_tickers.csv"):
-        tm_df = pd.read_csv("oefof_pl/data/yahoo_tickers.csv")
+    if os.path.exists(ticker_map_path):
+        tm_df = pd.read_csv(ticker_map_path)
         
         # DEFINITIVE FIX: Force all column headers to be completely lowercase
         tm_df.columns = tm_df.columns.str.lower()
@@ -73,18 +154,8 @@ def build_comparison_analysis():
                 # Standard 100x penny stock rule conversion for London (.L) listings
                 yahoo_price = y_val / 100.0 if str(yahoo_ticker).endswith(".L") else y_val
 
-        # Infer explicit Google Ticker formats based on exchange rules
-        if isin.startswith("AEA") or isin.startswith("AEE") or isin.startswith("AEN"):
-            google_ticker = f"ADX:{sname.split()[0]}"
-        elif isin.startswith("PHY"):
-            google_ticker = f"PSE:{sname.split()[0]}"
-        elif isin.startswith("SA"):
-            numeric_code = re.findall(r"\d+", str(yahoo_ticker))
-            google_ticker = f"TADAWUL:{numeric_code[0]}" if numeric_code else f"TADAWUL:{sname.split()[0]}"
-        elif isin.startswith("PL"):
-            google_ticker = f"WSE:{sname.split()[0]}"
-        else:
-            google_ticker = str(yahoo_ticker).replace(".HK", ":HKG").replace(".NS", ":NSE").replace(".SA", ":BVMF")
+        # Infer Google ticker with deterministic mapping and exchange suffix translation.
+        google_ticker = infer_google_ticker(isin=isin, security_name=sname, yahoo_ticker=yahoo_ticker)
 
         # Map sheet columns: D=HiPort Price, F=Yahoo Price, H=Google Price
         google_price_formula = f'=INDEX(GOOGLEFINANCE("{google_ticker}", "close", DATE(2026,5,31)), 2, 2)' if google_ticker else ""
@@ -118,9 +189,9 @@ def build_comparison_analysis():
         row_num += 1
 
     output_df = pd.DataFrame(matrix_rows)
-    os.makedirs("out", exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     
-    file_path = "out/valuation_variance_analysis.csv"
+    file_path = os.path.join(out_dir, "valuation_variance_analysis.csv")
     output_df.to_csv(file_path, index=False)
     
     print("\n" + "-" * 80)
