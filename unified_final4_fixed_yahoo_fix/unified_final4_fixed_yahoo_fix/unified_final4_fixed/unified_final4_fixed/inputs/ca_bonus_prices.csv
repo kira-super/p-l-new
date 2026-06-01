@@ -1,0 +1,14 @@
+# Optional bonus-share price overrides (price-only; no unit injection).
+# Used to patch zero-price BONUS buy trades before WAC so avg_buy/cost basis
+# can reflect an agreed notional grant price for attribution reporting.
+#
+# Columns:
+#   ISIN   normalized ISIN (no ':FUT' style synthetic keys)
+#   DATE   trade date YYYY-MM-DD (matches CDATE on bonus buy row)
+#   PRICE  local-currency price to inject into GROSSPRICE_LOCAL
+#   REASON optional audit text
+#
+# Example:
+# ISIN,DATE,PRICE,REASON
+# VN000000VCK5,2026-03-11,24.50,VPS bonus shares 2026-03-11 at market
+ISIN,DATE,PRICE,REASON
