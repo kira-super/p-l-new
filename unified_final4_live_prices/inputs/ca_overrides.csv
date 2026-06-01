@@ -1,0 +1,35 @@
+# Corporate-action unit overrides
+# ------------------------------------------------------------------------
+# Use this file when HiPort's snapshot reflects a corporate action (bonus,
+# split, consolidation, redenomination, in-kind delivery) that did NOT
+# arrive in the StockTrList Bottler trade feed for the period. Each row
+# is injected into the period trade list as a synthetic T='P' trade at
+# price 0, dated end_vdate, BCODE='CA_ADJ'. WAC handles it correctly:
+#
+#   UNITS > 0  (e.g. bonus shares)         -> units up,  cost unchanged
+#                                             => WAC dilutes (correct)
+#   UNITS < 0  (e.g. consolidation, return) -> units down, cost unchanged
+#                                             => WAC scales up (correct)
+#
+# This unblocks VAL-01 and gives correct WAC. Add ONE row per ISIN for
+# the running period. Re-evaluate every period (rows do not auto-clear).
+#
+# Columns:
+#   ISIN     normalised ISIN (12-char, upper)
+#   UNITS    SIGNED unit adjustment = HiPort end_units MINUS expected end_units
+#            (i.e. the VAL-01 "Diff" value, with its sign preserved)
+#   PRICE    synthetic trade gross price in local CCY (optional; default 0)
+#   REASON   free text (broker note, ops ticket, etc.) -- audit trail
+#
+# Lines starting with '#' are ignored. Trailing whitespace is trimmed.
+#
+# ── 2026-04 known CAs (from VAL-01 failure 2026-04-30) ───────────────────
+# Confirm each with ops before relying on the run. Then uncomment.
+#
+# ISIN,UNITS,PRICE,REASON
+# KR7443060009,-3105,0,HD Hyundai Marine -- TODO confirm CA (3105 units missing post 2026-04-24)
+# SA12U0RHUHH8,-2257,0,United Electronics CFD -- TODO confirm broker reset/CA
+# SA165I21VPH1,1530,0,Tasheel -- TODO confirm bonus issue
+# VN000000FPT1,-51000,0,FPT Corporation -- TODO confirm VN bonus/redenomination
+ISIN,UNITS,PRICE,REASON
+GRS434003000,97347,17.9206,PPC CFD->physical conversion 2026-05-21 at CFD avg exit price

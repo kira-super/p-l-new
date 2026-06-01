@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oefof-pl"
+version = "0.1.0"
+description = "OAKS Emerging and Frontier Fund — stock-level P&L pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary — Fiera Capital internal use only." }
+authors = [{ name = "Fiera Capital — OEFOF Team" }]
+keywords = ["oefof", "p&l", "valuation", "fund-accounting"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Office/Business :: Financial",
+]
+dependencies = [
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "openpyxl>=3.1",
+    "pyxlsb>=1.0",
+    "pyarrow>=14.0",
+    "pyodbc>=5.0",
+]
+
+[project.optional-dependencies]
+com = ["pywin32>=306"]
+dev = ["pytest>=8", "pytest-cov>=5"]
+
+[project.scripts]
+oefof-pl = "oefof_pl.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["oefof_pl*"]
+exclude = ["tests*", "bin*"]
+
+[tool.setuptools.package-data]
+oefof_pl = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning:openpyxl",
+]

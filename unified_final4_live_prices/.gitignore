@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Build / venv
+build/
+dist/
+.venv/
+
+# Generated reports — never commit production output
+out/
+*.parquet
+OAKS_EM_*.xlsx
+current portfolio.xlsx
+*.xlsx.tmp
+.analyst_map_*.csv.tmp
+
+# Run logs
+run.log
+run.err
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
